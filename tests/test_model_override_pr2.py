@@ -479,6 +479,51 @@ def test_update_model_override_refuses_a_codex_review_card_and_writes_nothing(bo
     assert _update(box, "--model-override", "none").returncode == 0     # 消す口は残す
 
 
+def test_update_reset_with_override_on_a_codex_review_card_writes_nothing(box):
+    # --reset の Controller 呼び出し (card のリセット・試行の解放) より前に拒否する (Codex 3 巡目 P1)
+    assert _update(box, "--skills", "codex-review").returncode == 0
+    assert _update(box, "--status", "in_progress").returncode == 0      # reset すれば pending に変わる card
+    before = box.snapshot()
+    r = _update(box, "--reset", "--model-override", "opus")
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert "codex-review" in r.stderr
+    assert box.snapshot() == before
+
+
+def test_update_skills_codex_review_together_with_override_is_refused_up_front(box):
+    before = box.snapshot()
+    r = _update(box, "--skills", "codex-review", "--reset", "--model-override", "opus")
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert box.snapshot() == before
+
+
+def _codex_review_root(tmp_path, override_line):
+    root = base._build_repo(tmp_path)
+    p = root / "queue" / "missions" / SLUG / "tasks" / "t001.md"
+    t = p.read_text()
+    t = re.sub(r"(skills:\s*\[)[^\]]*(\])", r"\1codex-review\2", t, count=1) if "skills: [" in t \
+        else re.sub(r"(skills:\n)(\s*- .*\n)+", r"\1  - codex-review\n", t, count=1)
+    p.write_text(t.replace("target_dir: null\n", f"target_dir: null\n{override_line}\n", 1))
+    return root
+
+
+def test_dispatcher_holds_a_codex_review_card_with_a_null_override_and_tells_once(tmp_path):
+    # 欄があれば値が null でも保留 (is not None で判定すると素通りする。Codex 3 巡目 P2)
+    root = _codex_review_root(tmp_path, "model_override: null")
+    _put_roster(root, [(AGENT, ["code"], None), ("Dirk", [], "director")])
+    spawned = []
+    mux = base.FakeMux([base.WINDOW, "Dirk-director"])
+    ns = base._load_dispatcher(root, mux)
+    ns["handle_codex_review"] = lambda *a, **k: spawned.append(a)
+    ns["dispatch"]()
+    assert not spawned
+    told = [m for _t, m in mux.sent if "[model-override-codex-review]" in m]
+    if told:          # Director 名の解決は環境依存。届いたなら 1 回だけ + 消し方が出る
+        assert len(told) == 1 and "--model-override none" in told[0]
+        ns["dispatch"]()
+        assert len([m for _t, m in mux.sent if "[model-override-codex-review]" in m]) == 1
+
+
 def test_dispatcher_holds_a_codex_review_card_that_has_an_override(tmp_path):
     root = base._build_repo(tmp_path)
     p = root / "queue" / "missions" / SLUG / "tasks" / "t001.md"

@@ -3198,7 +3198,7 @@ def dispatch():
         if task_skills & CODEX_REVIEW_SKILLS:
             # codex-review に model_override が付いている card (手書き・skills の後からの変更) は spawn せず保留 (設計: codex-review には欄を書かない)。
             # Director に 1 回だけ (状態ベース。消せば台帳から捨てられる)。
-            if meta.get('model_override') is not None:
+            if 'model_override' in meta:
                 _ckey = f'model-override-codex-review-{slug}-{task_id}'
                 live_state_keys.add(_ckey)
                 def _cmsg(_t=task_id, _s=slug):

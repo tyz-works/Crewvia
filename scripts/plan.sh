@@ -7421,6 +7421,14 @@ def cmd_update(args):
             eff_deliverable = deliverable if deliverable is not None else meta.get('deliverable')
             _reject_unproducible_deliverable(eff_skills if isinstance(eff_skills, list) else [],
                                              eff_deliverable)
+        if model_override_update is not _MO_UNSET and model_override_update is not None:
+            # codex-review は kai-review.sh が走らせ、束ねも override も使わない (設計: codex-review には欄を書かない)。
+            # 書くと pull がモデル判定で止まる。none (消す) は通す。--reset の Controller 呼び出しより前 (拒否は何も書かない)・
+            # --skills で変わった後の skills で見る
+            _mo_skills = ([s.strip() for s in opts['--skills'].split(',') if s.strip()]
+                          if opts.get('--skills') is not None else meta.get('skills'))
+            if 'codex-review' in set(_mo_skills if isinstance(_mo_skills, list) else []):
+                _usage_exit(f"{task_id} は skills に codex-review を含むので --model-override は付けられません。何も書いていません")
         pr_number_update = _UNSET = object()
         if opts.get('--pr-number') is not None:
             raw_pr = opts['--pr-number'].strip()
@@ -7575,10 +7583,6 @@ def cmd_update(args):
                     meta.pop(k, None)
                 changed.append('model_override=none')
             else:
-                if 'codex-review' in set(meta.get('skills') or []):
-                    # codex-review は kai-review.sh が走らせ、束ねも override も使わない (設計: codex-review には欄を書かない)。
-                    # 書くと pull がモデル判定で止まる。none (消す) は上の分岐で通る
-                    _usage_exit(f"{task_id} は skills に codex-review を含むので --model-override は付けられません。何も書いていません")
                 meta['model_override'] = model_override_update
                 changed.append(f"model_override={model_override_update}")
 

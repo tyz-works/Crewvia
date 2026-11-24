@@ -226,3 +226,44 @@ _mission() {   # _mission <override|-> : 使い捨ての queue に mission と t
     run _record Ren
     [[ "$output" == *'"bound_task": null'* ]]
 }
+
+# --- attempt 6: queue の明示・model.json は spawn の前・生きた Worker の記録は残る ---
+
+_wrap_tmux() {   # _wrap_tmux <new-window/new-session のときに実行するシェル片> : 本物の fake tmux を包む
+    mv "${FAKE_DIR}/tmux" "${FAKE_DIR}/tmux.real"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        "case \"\${1:-}\" in new-session|new-window) $1 ;; esac" \
+        "$2" \
+        "exec \"${FAKE_DIR}/tmux.real\" \"\$@\"" > "${FAKE_DIR}/tmux"
+    chmod +x "${FAKE_DIR}/tmux"
+}
+
+@test "model-for reads REPO_ROOT/queue even when the inherited CREWVIA_QUEUE points elsewhere" {
+    _mission opus
+    unset CREWVIA_WORKER_MODEL
+    mkdir -p "${BATS_TEST_TMPDIR}/other-queue"
+    CREWVIA_QUEUE="${BATS_TEST_TMPDIR}/other-queue" CREWVIA_PRINT_MODEL=1 CREWVIA_BIND_TASK=m-bind/t001 \
+        run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    [ "$output" = "opus" ]
+}
+
+@test "model.json exists before the window is spawned" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    _wrap_tmux "[ -f \"${REPO_ROOT}/registry/workers/Ren/model.json\" ] && touch \"${BATS_TEST_TMPDIR}/had-record\"" ''
+    run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    [ -f "${BATS_TEST_TMPDIR}/had-record" ]
+}
+
+@test "a refused spawn leaves a live Worker's model.json as it was" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    python3 "${REPO_ROOT}/scripts/lib_worker_model.py" record "${REPO_ROOT}/registry" Ren env opus m-old/t009 >/dev/null
+    before="$(_record Ren)"
+    # 窓が既にあり (list-windows)、中身は読めない = busy → spawn は 10/11 で断る
+    _wrap_tmux 'true' 'case "${1:-}" in list-windows) echo "Ren-worker"; exit 0 ;; esac'
+    run bash "$START_SH" worker --name Ren code python
+    after="$(_record Ren)"
+    [ "$before" = "$after" ]
+    [[ "$after" == *'"bound_task": "m-old/t009"'* ]]
+}

@@ -177,8 +177,10 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
                                  "一致すれば approved_head 行を、食い違えば再レビューが要る旨をその Result の一時ファイルに追記する (3 箇所。同じ mktemp ファイル・queue / registry ではない)"),
     ('review-plan.sh', '<bash>'): (6, "plan_review.md / plan_review.verdict の tmp+mv と reviewer ログ。書き手 1 者で run_id で鮮度を"
                                      "確かめる読み手がいる (§5.1 の「寄せない」)"),
-    ('start.sh', '<bash>'): (7, "Worker の settings / prompt の一時ファイルと refusals.log (registry/start-sh)。queue の状態を書かない。"
-                                "起動時の 1 者"),
+    ('start.sh', '<bash>'): (12, "Worker の settings / prompt の一時ファイルと refusals.log (registry/start-sh)。queue の状態を書かない。"
+                                 "起動時の 1 者。+5 (モデルの段上げ PR-2): spawn が断られたときに model.json を元に戻す退避 (mktemp への cp -p)・"
+                                 "復元 (cp -p)・退避の後始末 (rm -f ×2)・前の記録が無かったときの model.json の削除 (rm -f)。"
+                                 "書き込みの本体 (model.json の作成) は lib_worker_model.py record を通る"),
     ('start.sh', '<module>'): (4, "Worker の `.claude/settings` (target_dir 側) を書く。queue / registry の外"),
     ('migrate-local-config.sh', '<bash>'): (9, "config/ の移行スクリプト (手動で 1 回走らせる)。書き先は config/crewvia.local.yaml・共通 config の復元・"
                                                "退避先 ~/crewvia-local-migrate-<時刻>/ (手元版・差分・dump) と stdout/stderr の捨て先だけで、"

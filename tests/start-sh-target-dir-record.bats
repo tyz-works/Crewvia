@@ -176,7 +176,9 @@ _record() {
     run bash "$START_SH" worker --name Ren code python
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"TARGET_DIR を記録できませんでした"* ]]
+    # model.json は spawn の前に書く (設計 §4.2) ので、書けなければ spawn も TARGET_DIR の記録も行わずに止まる
+    [[ "$output" == *"モデルの記録を書けませんでした"* ]]
+    [[ "$output" != *"Agent launched"* ]]
     grep -q 'kind=bind-task-record' "${REPO_ROOT}/logs/start-sh/refusals.log"
 }
 

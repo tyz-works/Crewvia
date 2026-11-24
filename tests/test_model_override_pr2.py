@@ -518,10 +518,10 @@ def test_dispatcher_holds_a_codex_review_card_with_a_null_override_and_tells_onc
     ns["dispatch"]()
     assert not spawned
     told = [m for _t, m in mux.sent if "[model-override-codex-review]" in m]
-    if told:          # Director 名の解決は環境依存。届いたなら 1 回だけ + 消し方が出る
-        assert len(told) == 1 and "--model-override none" in told[0]
-        ns["dispatch"]()
-        assert len([m for _t, m in mux.sent if "[model-override-codex-review]" in m]) == 1
+    assert told, mux.sent          # 通知は無条件に出る (届かなければ保留が無言になる)
+    assert len(told) == 1 and "--model-override none" in told[0]
+    ns["dispatch"]()
+    assert len([m for _t, m in mux.sent if "[model-override-codex-review]" in m]) == 1
 
 
 def test_dispatcher_holds_a_codex_review_card_that_has_an_override(tmp_path):

@@ -119,6 +119,8 @@ _resolve_worker_model() {
 # check_mission_slug / check_task_id も plan.sh 側。start.sh は値を渡すだけ)。決められない (値が壊れている・card が無い・
 # model_override が壊れている・exit 1) ときは **起動しない** — 束ねの無い Worker が普通に task を取るより安全。
 # dry-run (CREWVIA_PRINT_MODEL=1) と実際の起動の両方が、ここで決めた BIND_MODEL を使う。
+# queue は REPO_ROOT/queue を**明示して渡す**: start.sh は後で CREWVIA_QUEUE を同じ値に固定するが、ここは固定の前なので、
+# 引き継いだ env (別の queue を指しうる) を読ませると card の解決が起動後の Worker と食い違う。
 BIND_TASK=""
 BIND_MODEL=""
 BIND_ERR=""
@@ -133,7 +135,7 @@ if [[ -n "${CREWVIA_BIND_TASK:-}" ]]; then
   else
     _BIND_SLUG="${BIND_TASK%%/*}"
     _BIND_TID="${BIND_TASK#*/}"
-    if _BIND_OUT="$(bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" --source 2>/dev/null)" \
+    if _BIND_OUT="$(CREWVIA_QUEUE="${REPO_ROOT}/queue" bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" --source 2>/dev/null)" \
         && BIND_MODEL="$(printf '%s\n' "$_BIND_OUT" | sed -n 1p)" && [[ -n "$BIND_MODEL" ]]; then
       BIND_SOURCE="$(printf '%s\n' "$_BIND_OUT" | sed -n 2p)"
       [[ "$BIND_SOURCE" == "override" ]] || BIND_SOURCE="skill"      # card に model_override が無い束ね = skills の既定 (override と書かない)
@@ -1011,9 +1013,38 @@ PYEOF
   # be reported as "already running".  Every other failure — including a
   # relaunch into an empty pane that did not take, after which the name is still
   # in `mux_list` — used to fall into the same message.
+  # model.json は spawn の**前**に書く (設計 §4.2)。窓が見えてから記録までの隙に dispatcher が「記録なし」と見て
+  # 退役させる・前任の記録で誤割り当てする経路を閉じる。書けなければ spawn しない (fail-closed)。
+  # 名前が mux に居る (= 生きた Worker か空の husk かまだ分からない) ときだけ、書く前に前の記録を退避し、
+  # spawn が 10/11 等で起動しなかったら戻す (生きた Worker の記録を上書きしたまま残さない)。
+  _MODEL_REC_FILE=""
+  _MODEL_REC_BACKUP=""
+  _MODEL_REC_RESTORE=0
+  if [[ "${ROLE}" == "worker" ]]; then
+    _MODEL_REC_FILE="${REPO_ROOT}/registry/workers/${AGENT_NAME}/model.json"
+    _MODEL_REC_RESTORE=1
+    if [[ -f "$_MODEL_REC_FILE" ]]; then
+      _MODEL_REC_BACKUP="$(mktemp 2>/dev/null)" && cp -p "$_MODEL_REC_FILE" "$_MODEL_REC_BACKUP" 2>/dev/null \
+        || { _MODEL_REC_BACKUP=""; echo "[crewvia] WARNING: 既存の model.json を退避できませんでした (起動しなかったときは戻せません)" >&2; }
+    fi
+    if ! _record_worker_model; then
+      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
+      exit 1
+    fi
+  fi
+  _restore_model_record() {
+    [[ "$_MODEL_REC_RESTORE" -eq 1 ]] || return 0
+    if [[ -n "$_MODEL_REC_BACKUP" ]]; then
+      cp -p "$_MODEL_REC_BACKUP" "$_MODEL_REC_FILE" 2>/dev/null || true
+      rm -f "$_MODEL_REC_BACKUP"
+    else
+      rm -f "${_MODEL_REC_FILE:?}"
+    fi
+  }
   SPAWN_RC=0
   mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" || SPAWN_RC=$?
   if [[ $SPAWN_RC -ne 0 ]]; then
+    _restore_model_record
     case $SPAWN_RC in
       10) echo "[crewvia] $WINDOW_NAME is already running — not launching a second one" ;;
       11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
@@ -1050,12 +1081,7 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
-    if ! _record_worker_model; then
-      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
-      mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
-        || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
-      exit 1
-    fi
+    [[ -n "$_MODEL_REC_BACKUP" ]] && rm -f "$_MODEL_REC_BACKUP"
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。

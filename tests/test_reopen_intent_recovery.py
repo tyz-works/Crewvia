@@ -29,7 +29,7 @@ from test_reopen_cascade_plan_sh import (  # noqa: E402
 )
 
 TIDS = ("t001", "t002", "t003")
-ARGV = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+ARGV = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse", "--cause", "mechanical"]
 
 
 def intent_dir(box):
@@ -346,7 +346,7 @@ def test_controller_refuses_a_new_reopen_while_an_intent_is_pending(tmp_path):
     import lib_state_store as store
     with store.transaction(box.queue, op="reopen", actor="Director") as txn:
         with pytest.raises(ctl.ex.ControllerError) as e:
-            ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON,
+            ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON, cause="mechanical",
                             graph={"t001": [], "t002": ["t001"], "t003": ["t002"]}, unreadable=[])
     assert e.value.code == "REOPEN_INTENT_INCOMPLETE"
 

@@ -3299,6 +3299,26 @@ def dispatch():
                 log(f"[vanished_worker] {slug}/{task_id}: worker {worker_name} tab gone + heartbeat stale — notified director")
 
 
+    # model-at-cap (モデルの段上げ PR-3。設計 knowledge/model-escalation.md §4.6): opus のまま 2 回差し戻された task を Director に 1 回だけ。
+    # 数は card の model_at_cap_count (Controller が差し戻しと同じ書き込みで +1)、fp は数がちょうど 2 になった差し戻しで閉じた試行の
+    # ID (model_at_cap_execution。3 回目以降は書き換わらない = 再送しない)。task の status は問わない (pending に戻った直後に
+    # 割り当てられても見逃さない)。欄が壊れている (整数でない・負・ID が不正) ときは出さない (割り当てには使わない値)。
+    # 台帳 (notified-state.json) を消すと次のサイクルでもう一度 1 回届く。update --model-override none は欄を消す = 数え直し。
+    for slug, meta in all_tasks:
+        _cap_n = meta.get('model_at_cap_count')
+        _cap_x = meta.get('model_at_cap_execution')
+        if (isinstance(_cap_n, bool) or not isinstance(_cap_n, int) or _cap_n < 2
+                or not isinstance(_cap_x, str) or not re.fullmatch(r'ex-[0-9a-f]{32}', _cap_x)):
+            continue
+        task_id = meta.get('id', '?')
+        _ckey = f'model-at-cap-{slug}-{task_id}'
+        live_state_keys.add(_ckey)
+        def _capmsg(_t=task_id, _s=slug):
+            return (f"[model-at-cap] {_s}/{_t} は opus のまま 2 回差し戻されました。task の分割・設計の見直しを検討してください "
+                    f"(plan.sh history {_t} --mission {_s})")
+        notify_state_once(_ckey, fingerprint('model_at_cap', _cap_x), 'model-at-cap', slug, task_id, _capmsg,
+                          director_live=director_live_for_state_notices)
+
     # needs_director detection: task escalated to needs_director → notify Director.
     # t027: previously nothing watched this transition (grep for 'needs_director' in
     # this file returned 0 hits) — a Codex NEEDS FIX or a Worker's `plan.sh
@@ -3343,7 +3363,7 @@ def dispatch():
                 + f' (全文: {task_file})。'
                 f'reason を読んで方針を決めてください。理由を渡して再挑戦させるなら '
                 f'plan.sh retry {task_id} --reason "<理由>" --mission {slug}、'
-                f'Codex / QA の指摘の修正は実装 task を plan.sh reopen <実装 task> --reason "<指摘>" --branch reuse --mission {slug}、'
+                f'Codex / QA の指摘の修正は実装 task を plan.sh reopen <実装 task> --reason "<指摘>" --branch reuse --cause quality|mechanical --mission {slug} (quality = 設計の誤り・考え不足 = モデルを上げる / mechanical = CI の赤・テストの書き方等 = 上げない)、'
                 f'理由の要らない差し戻しは plan.sh update {task_id} --status pending --reset '
                 f'--mission {slug} で差し戻してください。'
                 + note

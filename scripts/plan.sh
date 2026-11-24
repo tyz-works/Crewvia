@@ -58,7 +58,7 @@ set -euo pipefail
 #   plan.sh update <task_id> --close-execution [--mission <slug>]
 #                              task に触れず、Controller の外で手放されて active のまま残った試行 (終わった task に残った
 #                              running 等。store-check の execution_active_on_finished_task) を failed / ABANDONED_OUTSIDE_CONTROLLER で閉じる
-#   plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]
+#   plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"] [--escalate-model | --no-escalate]
 #                              終わった試行の task (failed / needs_director / needs_human_review / verification_failed) を、
 #                              理由つきで pending に戻す (新しい task を足さない)。試行が active なら exit 3 (先に
 #                              update --close-execution か --reset)。pr_number・execution_count・rework_count は保ち、worker /
@@ -66,7 +66,9 @@ set -euo pipefail
 #                              総試行数 (execution_count) が上限 (config attempts.max_total、既定 6。card の max_attempts で上書き)
 #                              に達していたら exit 3 (ATTEMPT_CAP)。--over-cap "<理由>" で通し、台帳の retry に残す。
 #                              理由は台帳にだけ書く (監査ログには出さない)。`update --reset` は残してある (理由が要らない差し戻し)
-#   plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>] [--cascade none|reviews|all] [--over-cap "<理由>"]
+#   plan.sh reopen <task_id> --reason "<理由>" --branch reuse --cause quality|mechanical [--mission <slug>] [--cascade none|reviews|all]
+#                              [--over-cap "<理由>"] [--escalate-model | --no-escalate]  (--cause は必須: quality = モデルを 1 段上げる /
+#                              mechanical = 上げない。段上げは実装 task だけ・設計 knowledge/model-escalation.md §4.1)
 #                              確定した結果 (done / verified / skipped) の task を、理由つきで pending に戻し (reopen_count += 1)、
 #                              下流の古い結果を無効化する (vNext 02 PR-F。設計 §4)。--branch reuse は必須 (merge 済みの PR の task は
 #                              扱わない。Director が確認して明示)。既定の --cascade reviews は skills に codex-review / review / qa を
@@ -2747,9 +2749,12 @@ USAGE = {
                '                       [--deliverable pr|file|none] [--blocked-reason "<理由>"]\n'
                '                       [--idle-timeout <s>] [--max-timeout <s>] [--model-override haiku|sonnet|opus|none]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
-    'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
-    'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>]\n'
-               '                       [--cascade none|reviews|all] [--over-cap "<理由>"]'),
+    'retry': ('plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]\n'
+              '                     [--escalate-model | --no-escalate]   (retry は既定でモデルを上げない。--escalate-model のときだけ 1 段上げる)'),
+    'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse --cause quality|mechanical [--mission <slug>]\n'
+               '                       [--cascade none|reviews|all] [--over-cap "<理由>"] [--escalate-model | --no-escalate]\n'
+               '  --cause (必須): quality = 設計の誤り・考え不足・要件の取り違え (モデルを 1 段上げる) /\n'
+               '                  mechanical = CI の赤・構造ガード・テストの書き方・細かい境界値や入力検査 (上げない)'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
@@ -2760,7 +2765,7 @@ USAGE = {
     'snapshot': 'plan.sh snapshot (<task_id> [--mission <slug>] | --self) --section-file <path|->',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
                       '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]\n'
-                      '                            [--execution <id>]'),
+                      '                            [--execution <id>] [--no-escalate]   (fail は既定でモデルを 1 段上げる。--no-escalate で止める)'),
     'review': 'plan.sh review <mission_slug>',
     'launch': 'plan.sh launch <mission_slug>',
     'task-graph': 'plan.sh task-graph',
@@ -6352,7 +6357,7 @@ def cmd_verify_result(args):
     needs_human_review → status: needs_human_review
     """
     opts, positional = parse_opts(args, {'--mission': 'value', '--notes': 'value',
-                                         '--notes-file': 'value', '--execution': 'value'})
+                                         '--notes-file': 'value', '--execution': 'value', '--no-escalate': 'bool'})
     if len(positional) < 2:
         die("verify-result requires <task_id> <verdict>")
     task_id = positional[0]
@@ -6444,7 +6449,8 @@ def cmd_verify_result(args):
             elif verdict == 'fail' and rework < max_rework:
                 result_exec = _CONTROLLER.fail_execution(
                     _txn(), slug, task_id, caller, _EXEC.VERIFICATION_REJECTED, to_status='pending',
-                    meta_updates=rework_updates, body=body_new)
+                    meta_updates=rework_updates, body=body_new,
+                    escalate=not opts.get('--no-escalate'), model_config=_MODEL_CONFIG)
                 new_status = 'pending'
             else:      # needs_human_review の verdict、または fail で rework が上限に達した
                 if verdict == 'fail':
@@ -6474,6 +6480,8 @@ def cmd_verify_result(args):
                 save_mission(slug, mission)
 
         print(f"verify-result: {slug}/{task_id} → {new_status} (verdict={verdict})")
+        if verdict == 'fail' and new_status == 'pending':
+            _print_model_change(slug, task_id, meta)
 
     with_lock(_do)
 
@@ -7646,6 +7654,60 @@ def cmd_update(args):
     with_lock(_do)
 
 
+_MODEL_CONFIG = os.path.join(REPO_ROOT, 'config', 'crewvia.yaml')
+
+
+def _cause_exit(message):
+    """差し戻しの種類・段上げの上書きの誤り: exit 3・何も書かない (既定に黙って倒さない)。task-graph も再生成しない。"""
+    print(f"plan.sh {SUBCOMMAND}: {message}", file=sys.stderr)
+    print(_usage_text(), file=sys.stderr)
+    raise UsageExit(3)
+
+
+def _escalation_flags(opts, command, cause=None):
+    """`--escalate-model` / `--no-escalate` の検査 (ロックの前)。同時指定・cause との食い違いは exit 3。戻り値: `(escalate_model, no_escalate)`。"""
+    esc, no = bool(opts.get('--escalate-model')), bool(opts.get('--no-escalate'))
+    if esc and no:
+        _cause_exit('--escalate-model と --no-escalate は同時に指定できません。何も書いていません')
+    if cause == 'mechanical' and esc:
+        _cause_exit('--cause mechanical と --escalate-model は食い違います (機械的な直しは上げない。上げるなら --cause quality)。何も書いていません')
+    if cause == 'quality' and no:
+        _cause_exit('--cause quality と --no-escalate は食い違います (上げないなら --cause mechanical)。何も書いていません')
+    return esc, no
+
+
+def _print_model_escalation(plan, out=None):
+    """差し戻しの出力の 1 行 (設計 §4.7)。plan は Controller の決定 (v1 の intent の完了は None = 何も出さない)。"""
+    if plan is None:
+        return
+    out = out or sys.stdout
+    code = plan['code']
+    if code == 'escalated':
+        print(f"  モデル: {plan['model_from']} → {plan['escalate_to']}（段上げ）。{plan['escalate_to']} で走らせるには、"
+              f"dispatcher の no_worker 通知の起動コマンド (CREWVIA_BIND_TASK 付き) で Worker を起動してください", file=out)
+    elif code == 'at_cap':
+        extra = '。2 回目なので次に dispatcher が Director に通知します' if plan['at_cap_count'] == 2 else ''
+        print(f"  モデル: {plan['escalate_to']} のまま（上限）。{plan['at_cap_count']} 回目の opus での差し戻し{extra}", file=out)
+    else:
+        print(f"  段上げしない（理由: {code}）", file=out)
+
+
+def _print_model_change(slug, task_id, before):
+    """retry / verify-result fail の出力: 書く前の card (`before`) と今の card の `model_override` / `model_at_cap_count` を比べて 1 行。
+    決定そのもの (Controller) ではなく card に実際に書かれた結果を見せる (上げなかったときは何も出さない)。"""
+    try:
+        after, _b = load_task(slug, task_id)
+    except SystemExit:
+        return
+    old, new = before.get('model_override'), after.get('model_override')
+    if new != old and _MODEL.is_alias(new):
+        print(f"  モデル: {old if _MODEL.is_alias(old) else '既定'} → {new}（段上げ）")
+    elif after.get('model_at_cap_count') != before.get('model_at_cap_count') and _MODEL.is_alias(new):
+        count = after.get('model_at_cap_count')
+        extra = '。2 回目なので次に dispatcher が Director に通知します' if count == 2 else ''
+        print(f"  モデル: {new} のまま（上限）。{count} 回目の opus での差し戻し{extra}")
+
+
 def cmd_retry(args):
     """plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]
 
@@ -7654,12 +7716,14 @@ def cmd_retry(args):
     実体は Controller の `reopen_task(kind='retry')`: 台帳 (`history/tNNN/`) に retry を 1 ファイル足してから card を書く。
     拒否 (試行が active・遷移元でない・総試行数の上限) は exit 3・何も書かない。`update --reset` は残してある (理由が要らない差し戻し)。
     """
-    opts, positional = parse_opts(args, {'--mission': 'value', '--reason': 'value', '--over-cap': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--reason': 'value', '--over-cap': 'value',
+                                         '--escalate-model': 'bool', '--no-escalate': 'bool'})
     task_id = positional[0]
     if not re.fullmatch(r't\d+', task_id):
         _usage_exit(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
     if '--reason' not in opts:
         _usage_exit('--reason "<理由>" が必要です (理由は台帳に残ります)')
+    escalate_model, no_escalate = _escalation_flags(opts, 'retry')
     # 検証はロックの前 (拒否は何も書かない。UsageExit は task-graph も再生成しない)
     try:
         reason = _CONTROLLER.check_reason(opts['--reason'], '--reason')
@@ -7681,12 +7745,18 @@ def cmd_retry(args):
         _refuse_write_while_intent_pending(slug, 'retry', task_id)
         default_cap = _default_cap_or_refuse('retry')
         try:
+            before, _b = load_task(slug, task_id)
+        except SystemExit:
+            before = {}
+        try:
             previous = _CONTROLLER.reopen_task(_txn(), slug, task_id, kind='retry', reason=reason, over_cap=over_cap,
-                                               default_max_attempts=default_cap)
+                                               default_max_attempts=default_cap, escalate_model=escalate_model,
+                                               no_escalate=no_escalate, model_config=_MODEL_CONFIG)
         except _EXEC.ControllerError as e:
             _controller_die('retry', e)
         print(f"Retried: {slug}/{task_id} — pending (attempt {previous.attempt} は {previous.end_code or previous.status} で終了。"
               f"次の pull が attempt {previous.attempt + 1} を発行します)")
+        _print_model_change(slug, task_id, before)
         _reactivate_done_mission(slug, via=f'retry {task_id}')
 
     with_lock(_do)
@@ -7718,7 +7788,8 @@ def cmd_reopen(args):
     途中で止まったら、次に queue を書くコマンド (pull を含む) が intent の続きを完了する。同じ引数の再実行でも完了する (`store-check` の `reopen-intent-incomplete` が印)。
     """
     opts, positional = parse_opts(args, {'--mission': 'value', '--reason': 'value', '--over-cap': 'value',
-                                         '--cascade': 'value', '--branch': 'value'})
+                                         '--cascade': 'value', '--branch': 'value', '--cause': 'value',
+                                         '--escalate-model': 'bool', '--no-escalate': 'bool'})
     task_id = positional[0]
     if not re.fullmatch(r't\d+', task_id):
         _usage_exit(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
@@ -7729,6 +7800,13 @@ def cmd_reopen(args):
                     '未 merge の PR の task であることを確認して、同じ branch・同じ PR を使う指定を明示してください)')
     if opts['--branch'] != 'reuse':
         _usage_exit("--branch は reuse だけです (merge 済みの PR の task の reopen は扱いません。新しい task を足してください)")
+    # 差し戻しの種類は必須 (exit 3・何も書かない)。無い・他の値を既定に倒さない
+    cause = opts.get('--cause')
+    if cause not in _MODEL.CAUSES:
+        _cause_exit('--cause quality|mechanical が必要です (指定: ' + (repr(cause) if cause is not None else 'なし') + ')。'
+                    'quality = 設計の誤り・考え不足・要件の取り違え (モデルを 1 段上げる) / '
+                    'mechanical = CI の赤・構造ガード・テストの書き方・細かい境界値や入力検査 (上げない)。何も書いていません')
+    escalate_model, no_escalate = _escalation_flags(opts, 'reopen', cause)
     try:
         cascade = _CONTROLLER.check_cascade(opts.get('--cascade'))
         reason = _CONTROLLER.check_reason(opts['--reason'], '--reason')
@@ -7768,8 +7846,11 @@ def cmd_reopen(args):
             mine = [i for _n, i in _CONTROLLER.list_pending_intents(_txn(), slug) if i['root'] == task_id]
             if mine:
                 intent = mine[0]
+                # v2 の intent は種類 (cause) も決定の一部。v1 (欄なし) は種類を持たない = 比べない
                 differs = [name for name, same in (('reason', intent['reason'] == reason), ('cascade', intent['cascade'] == cascade),
-                                                   ('over_cap', intent['over_cap'] == over_cap)) if not same]
+                                                   ('over_cap', intent['over_cap'] == over_cap),
+                                                   ('cause', intent.get('model') is None or intent['model']['cause'] == cause))
+                           if not same]
                 if differs:
                     raise _EXEC.ControllerError(
                         _EXEC.HISTORY_MISMATCH,
@@ -7790,7 +7871,8 @@ def cmd_reopen(args):
             try:
                 res = _CONTROLLER.reopen_task(
                     _txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap, default_max_attempts=default_cap,
-                    cascade=cascade, graph=graph, unreadable=unreadable,
+                    cascade=cascade, graph=graph, unreadable=unreadable, cause=cause, escalate_model=escalate_model,
+                    no_escalate=no_escalate, model_config=_MODEL_CONFIG,
                     before_write=lambda: (_reopen_stop_hint(task_id, sys.stderr),
                                           _reactivate_done_mission(slug, via=f'reopen {task_id}')))
             except _EXEC.ControllerError as e:
@@ -7798,6 +7880,7 @@ def cmd_reopen(args):
         prev = res.execution
         print(f"Reopened: {slug}/{task_id} — pending (attempt {prev.attempt} の結果を見直します。"
               f"次の pull が attempt {prev.attempt + 1} を発行します)")
+        _print_model_escalation(res.model_plan)
         if res.reopened:
             print(f"  下流を pending に戻した (cascade={cascade}): {', '.join(res.reopened)}")
         if res.reset:

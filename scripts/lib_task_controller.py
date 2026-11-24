@@ -55,6 +55,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import lib_dep_rules as dep  # noqa: E402
 import lib_execution as ex  # noqa: E402
 import lib_history as hist  # noqa: E402
+import lib_model as _model  # noqa: E402
 import lib_state_store as store  # noqa: E402
 import lib_task_status as _status  # noqa: E402
 
@@ -389,6 +390,57 @@ def _result_for_ledger(out, xid, body_out):
         text = hist.result_section(body_out)
         return (hist.RESULT_RECORDED, text) if text else (hist.RESULT_NONE, '')
     return hist.RESULT_NONE, ''                              # 別の試行の Result。この試行の履歴には入れない
+
+
+# ---------------------------------------------------------------------------
+# モデルの自動の段上げ (PR-3。設計 knowledge/model-escalation.md §4.1・§4.6・§6)
+# ---------------------------------------------------------------------------
+
+def _model_plan(meta, *, wants, model_config):
+    """差し戻しで card を pending に戻す前に、段上げを決める (`lib_model.decide_escalation`。判定の表はそこの 1 か所)。
+    起点は閉じる試行の `execution_model`。card の `model_at_cap_*` が壊れていれば数は 0 から (書くときに正しい値になる)。"""
+    count = meta.get('model_at_cap_count', 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        count = 0
+    at_cap_xid = meta.get('model_at_cap_execution')
+    return _model.decide_escalation(
+        wants, skills=_skills_of(meta), closed_model=meta.get(ex.EXECUTION_MODEL_FIELD),
+        current_override=meta.get('model_override'), config_path=model_config or '',
+        closed_execution_id=meta.get('current_execution_id'), at_cap_count=count,
+        at_cap_execution=at_cap_xid if ex.is_execution_id(at_cap_xid) else None)
+
+
+def _plan_ledger_fields(plan, cause=None, always=False):
+    """台帳の `model_from` / `model_to` / `model_escalation` / `cause` (無ければ欄なし)。`always` は reopen の根 (種類を必ず残す)。"""
+    out = {}
+    if cause is not None:
+        out['cause'] = cause
+    if plan is not None and (always or plan['code'] != _model.ESC_DECLINED):
+        out['model_escalation'] = plan['code']
+    if plan is not None and plan['applied']:
+        out['model_from'] = plan['model_from']
+        out['model_to'] = plan['escalate_to']
+    return out
+
+
+def _plan_card_updates(plan):
+    """card の pending への書き込みに**同じ書き込みで**載せる欄 (段上げが適用されたときだけ)。"""
+    if plan is None or not plan['applied']:
+        return {}
+    out = {'model_override': plan['escalate_to']}
+    if plan['code'] == _model.ESC_AT_CAP:
+        out['model_at_cap_count'] = plan['at_cap_count']
+        if plan['at_cap_execution'] is not None:
+            out['model_at_cap_execution'] = plan['at_cap_execution']
+    return out
+
+
+def _notice(plan):
+    """段上げの結果を stderr に (固定コードだけ。`plan.sh` の出力はこの値から作る)。"""
+    if plan is not None and plan['code'] in (_model.ESC_SKIPPED_CONFIG, _model.ESC_SKIPPED_NO_BASE):
+        print(f"MODEL_ESCALATION_SKIPPED:{plan['code'].split(':', 1)[1]}", file=sys.stderr)
+    elif plan is not None and plan['code'] == _model.ESC_NOT_APPLICABLE:
+        print("MODEL_ESCALATION_NOT_APPLICABLE", file=sys.stderr)
 
 
 #: reopen の intent を実行している間だけ入る、**intent を書いた人**の台帳上の actor (`(actor,)`。None = 上書きなし)。
@@ -873,7 +925,8 @@ def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_upda
 
 
 def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_status, meta_updates=None,
-                   meta_remove=(), body=None, now=None, dry_run=False, result_replaced=False, checkpoint_dir=None):
+                   meta_remove=(), body=None, now=None, dry_run=False, result_replaced=False, checkpoint_dir=None,
+                   escalate=False, model_config=None):
     """reserved | running → failed。`failure_code` は終了コード (`_FAIL_RULES` の 6 つ)、`to_status` は task の遷移先で、
     組み合わせは §4.2 の表だけ:
 
@@ -888,6 +941,10 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
 
     `result_replaced=True` は `body` が `## Result` 節を置き換えたと**呼び出し側が明示**するとき (fail)。needs-director・
     verify-result・retire の `body` は節を足すだけなので渡さない。
+
+    `escalate=True` (`VERIFICATION_REJECTED` だけ。PR-3 / 設計 §4.1) は、検証者が出来を断った差し戻しでモデルを 1 段上げる: 決定は
+    `_model_plan` (起点 = 閉じる試行の `execution_model`)、`model_override` 等は pending と**同じ card の書き込み**に、台帳に
+    `model_*` を載せる。他の `failure_code` に付けると `INVALID_ARGUMENT`。`model_config` は config/crewvia.yaml のパス。
     """
     rule = _FAIL_RULES.get(failure_code)
     if rule is None:
@@ -898,12 +955,21 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
     if clear_owner is None:
         clear_owner = to_status == _S_PENDING
     meta, card_body = _load(txn, slug, tid)
+    ledger_extra = None
+    if escalate:
+        if failure_code != ex.VERIFICATION_REJECTED:
+            raise _err(ex.INVALID_ARGUMENT, "escalate は VERIFICATION_REJECTED だけに付けられます", slug, tid)
+        plan = _model_plan(meta, wants=True, model_config=model_config)
+        if not dry_run:
+            _notice(plan)
+        meta_updates = {**(meta_updates or {}), **_plan_card_updates(plan)}
+        ledger_extra = _plan_ledger_fields(plan) or None
     return _finish(txn, slug, tid, meta, card_body, caller, new_status=ex.FAILED, end_code=failure_code,
                    to_status=to_status, command=command, operation=operation, clear_owner=clear_owner,
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
                    required_exec_status=({ex.RESERVED} if failure_code == ex.WORKSPACE_CREATE_FAILED else None),
                    abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run,
-                   result_replaced=result_replaced, checkpoint_dir=checkpoint_dir)
+                   result_replaced=result_replaced, checkpoint_dir=checkpoint_dir, ledger_extra=ledger_extra)
 
 
 def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None,
@@ -987,7 +1053,8 @@ def check_reason(value, name):
 
 
 def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_attempts=hist.DEFAULT_MAX_ATTEMPTS, now=None,
-                cascade=DEFAULT_CASCADE, graph=None, unreadable=None, before_write=None):
+                cascade=DEFAULT_CASCADE, graph=None, unreadable=None, before_write=None, cause=None,
+                escalate_model=False, no_escalate=False, model_config=None):
     """終わった試行の task を、理由つきで pending に戻す (retry。設計 §3.3)。**新しい task を足さない**。
 
     遷移元: `lib_task_status.ACCEPTS_FROM['retry']` (failed / needs_director / needs_human_review / verification_failed)。
@@ -1007,6 +1074,8 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
 
     `kind='reopen'` (PR-F。設計 §4) は done / verified / skipped の task を `reopen_count += 1` で pending に戻し、`cascade` と
     `graph` (`{task id: blocked_by}`。mission の全 task) に従って下流も戻す (`_reopen_cascade`)。戻り値は `ReopenResult`。
+    モデルの段上げ (PR-3): reopen は `cause` (quality / mechanical。**必須**) で決まり (`--escalate-model` / `--no-escalate` は例外の上書き。
+    cause と食い違う指定は `INVALID_ARGUMENT`)、retry は `escalate_model=True` のときだけ上げる。`model_config` は config/crewvia.yaml のパス。
     `unreadable` (reopen では必須) は mission の読めない・壊れた card の id の並び。1 つでもあれば `CASCADE_UNREADABLE_CARDS`
     (graph では壊れた card が依存の無い孤立 node になり、そこを通る経路が消える)。
     """
@@ -1015,7 +1084,12 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
     command = _REOPEN_KINDS[kind]
     if kind == 'reopen':
         return _reopen_cascade(txn, slug, tid, reason=reason, over_cap=over_cap, default_max_attempts=default_max_attempts,
-                               now=now, cascade=cascade, graph=graph, unreadable=unreadable, before_write=before_write)
+                               now=now, cascade=cascade, graph=graph, unreadable=unreadable, before_write=before_write,
+                               cause=cause, escalate_model=escalate_model, no_escalate=no_escalate, model_config=model_config)
+    if cause is not None:
+        raise _err(ex.INVALID_ARGUMENT, "cause は reopen だけの引数です", slug, tid)
+    if escalate_model and no_escalate:
+        raise _err(ex.INVALID_ARGUMENT, "escalate_model と no_escalate は同時に指定できません", slug, tid)
     reason = check_reason(reason, 'reason')
     if over_cap is not None:
         over_cap = check_reason(over_cap, 'over_cap')
@@ -1046,17 +1120,22 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
         _refuse(txn, ex.ATTEMPT_CAP,
                 f"task '{tid}': 総試行数 {count} が上限 {cap} に達しています。続けるなら --over-cap \"<理由>\" を付けるか、"
                 f"card の max_attempts を上げてください", slug, tid, meta)
+    plan = _model_plan(meta, wants=_model.want_escalation('retry', escalate_model=escalate_model, no_escalate=no_escalate),
+                       model_config=model_config)
+    _notice(plan)
     return _write_reopen(txn, slug, tid, meta, body, kind=kind, reason=reason, count=count,
-                         over_cap=over_cap if over else None, bump=False, now=now)[0]
+                         over_cap=over_cap if over else None, bump=False, now=now, plan=plan)[0]
 
 
 def _write_reopen(txn, slug, tid, meta, body, *, kind, reason, count, over_cap, bump, now, root=None, root_reopen_count=None,
-                  dry_run=False):
+                  dry_run=False, plan=None, cause=None, always=False):
     """retry / reopen が task 1 枚を pending に戻す共通の書き込み (台帳 → card (コミット点) → 枠の撤去 → record)。
 
     `bump=True` (reopen) は card の `reopen_count` を 1 増やす。台帳の `reopen_count` は**増やす前**の値 (同定キー
     (execution_id, kind, reopen_count) が再送で変わらない)。`root` / `root_reopen_count` は cascade で戻される下流にだけ付く。
     `dry_run=True` は台帳の食い違い (`HISTORY_MISMATCH` 等) を検査するだけで何も書かない。
+    `plan` (`_model_plan` の結果) は段上げの決定で、台帳の欄と card の `model_override` 等を**同じ書き込み**に載せる。
+    `cause` は reopen の差し戻しの種類 (台帳の `cause`)、`always` は決定が declined でも `model_escalation` を残す (reopen の根)。
     戻り値: `(Execution, 台帳を再利用したか)`。dry_run は `(None, 再利用するか)`。"""
     xid = meta.get('current_execution_id')
     previous = meta.get('status')
@@ -1072,7 +1151,7 @@ def _write_reopen(txn, slug, tid, meta, body, *, kind, reason, count, over_cap, 
             reopen_count=reopen, head=meta.get('fail_head'), pr_number=meta.get('pr_number'), worker=meta.get('worker'),
             actor=_ledger_actor(txn), reason=reason, handoff_path=meta.get('handoff_path'),
             over_cap=over_cap, result_state=hist.RESULT_NONE, root=root, root_reopen_count=root_reopen_count,
-            model=meta.get(ex.EXECUTION_MODEL_FIELD))
+            model=meta.get(ex.EXECUTION_MODEL_FIELD), **_plan_ledger_fields(plan, cause, always))
         return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, text, ended_at)
 
     if dry_run:
@@ -1089,6 +1168,7 @@ def _write_reopen(txn, slug, tid, meta, body, *, kind, reason, count, over_cap, 
         out['reopen_count'] = reopen + 1
     for key in _RETRY_CLEARED_EVIDENCE:
         out.pop(key, None)
+    out.update(_plan_card_updates(plan))                         # 段上げは pending と同じ書き込み
     txn.write_card(slug, tid, out, body)                         # コミット点
     if owner is not None:
         txn.retire_assignment(owner, slug, tid, None)
@@ -1110,13 +1190,20 @@ class ReopenResult:
     stale: tuple                     # 戻していない完了済みの下流 (古い結果に基づく。Director が判断する)
     unreleased: tuple                # `released_deps` から I を消した下流
     resumed: bool                    # 途中で止まった reopen を (回復・再実行で) intent に従って完了させた
+    model_plan: dict = None          # 段上げの決定 (intent の `model`。v1 の intent は None = 段上げなし。出力と通知用)
+    cause: str = None                # 差し戻しの種類 (quality / mechanical。v1 は None)
     stale_runnable: tuple = ()       # 戻さなかった pending の下流のうち、I の再完了を待たず古い中間の結果で走りうるもの
 
 
 #: reopen の intent の版 (`queue/missions/<slug>/reopen-intents/<root>-<n>.json`。設計 §4.3.1)
-INTENT_VERSION = 1
+INTENT_VERSION = 2          # 書き手は常にこの版。v1 (PR-3 より前に書かれた未完のもの) は読める (段上げしないで完了させる。設計 §6)
 _INTENT_KEYS = {'version', 'actor', 'root', 'root_reopen_count', 'reason', 'cascade', 'over_cap', 'root_capped', 'created_at', 'closure',
                 'tasks', 'unrelease'}
+#: 版ごとの欄の集合 (厳密に照合する)。v2 は欄 `model` (段上げの決定。下の `_INTENT_MODEL_KEYS`) を足す
+_INTENT_KEYS_BY_VERSION = {1: _INTENT_KEYS, 2: _INTENT_KEYS | {'model'}}
+_INTENT_MODEL_KEYS = {'escalate_to', 'model_from', 'model_escalation', 'at_cap_count', 'at_cap_execution', 'cause'}
+_ESC_CODES = frozenset({_model.ESC_ESCALATED, _model.ESC_AT_CAP, _model.ESC_DECLINED, _model.ESC_NOT_APPLICABLE,
+                        _model.ESC_SKIPPED_CONFIG, _model.ESC_SKIPPED_NO_BASE})
 _TID_RE = re.compile(r't\d+')
 
 
@@ -1142,7 +1229,10 @@ def parse_reopen_intent(slug, name, text):
         data = json.loads(text)
     except ValueError:
         raise _intent_problem(slug, name, 'json_parse_error') from None
-    if not isinstance(data, dict) or set(data) != _INTENT_KEYS or data['version'] != INTENT_VERSION:
+    version = data.get('version') if isinstance(data, dict) else None
+    # bool (True == 1)・知らない版 (0 / 3 以上)・文字列は shape。欄の集合は版ごとに厳密に照合する
+    keys = _INTENT_KEYS_BY_VERSION.get(version) if type(version) is int else None
+    if not isinstance(data, dict) or keys is None or set(data) != keys:
         raise _intent_problem(slug, name, 'shape')
 
     def _int(v):
@@ -1168,9 +1258,34 @@ def parse_reopen_intent(slug, name, text):
                     and t['id'] in data['closure'] and t['op'] in ('reopen', 'reset') and isinstance(t['capped'], bool)):
                 ok = False
                 break
+    if ok and 'model' in data and not _intent_model_ok(data['model']):
+        ok = False
     if not ok:
         raise _intent_problem(slug, name, 'shape')
     return data
+
+
+def _intent_model_ok(m):
+    """v2 の `model` 欄の形 (中の欄も集合を厳密に照合する)。"""
+    if not isinstance(m, dict) or set(m) != _INTENT_MODEL_KEYS:
+        return False
+    count = m['at_cap_count']
+    return ((m['escalate_to'] is None or _model.is_alias(m['escalate_to']))
+            and (m['model_from'] is None or _model.is_alias(m['model_from']))
+            and isinstance(m['model_escalation'], str) and m['model_escalation'] in _ESC_CODES
+            and isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            and (m['at_cap_execution'] is None or ex.is_execution_id(m['at_cap_execution']))
+            and isinstance(m['cause'], str) and m['cause'] in _model.CAUSES)
+
+
+def _plan_of_intent(intent):
+    """intent の `model` から `(plan, cause)`。v1 (欄なし) は `(None, None)` = 段上げしない・種類も残さない (決定の後に足さない)。"""
+    m = intent.get('model')
+    if m is None:
+        return None, None
+    plan = dict(code=m['model_escalation'], escalate_to=m['escalate_to'], model_from=m['model_from'],
+                at_cap_count=m['at_cap_count'], at_cap_execution=m['at_cap_execution'], applied=m['escalate_to'] is not None)
+    return plan, m['cause']
 
 
 def list_pending_intents(txn, slug):
@@ -1262,13 +1377,16 @@ def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
     if meta.get('status') in _ACCEPTS['reopen']:
         if not ex.has_execution_fields(meta):
             raise _intent_problem(slug, intent_name(root, need), f'{root}:no_execution')
+        plan, cause = _plan_of_intent(intent)
         execution = _write_reopen(txn, slug, root, meta, body, kind='reopen', reason=reason, count=meta['execution_count'],
-                                  over_cap=intent['over_cap'] if intent['root_capped'] else None, bump=True, now=now)[0]
+                                  over_cap=intent['over_cap'] if intent['root_capped'] else None, bump=True, now=now,
+                                  plan=plan, cause=cause, always=plan is not None)[0]
     else:
         execution = _execution_of(txn, slug, root, meta)         # 既に pending (card を書いた後で止まった)
     txn.remove_reopen_intent(slug, intent_name(root, need))
+    plan, cause = _plan_of_intent(intent)
     return ReopenResult(execution=execution, reopened=tuple(reopened), reset=tuple(reset), already=tuple(already), stale=(),
-                        unreleased=tuple(unreleased), resumed=resumed)
+                        unreleased=tuple(unreleased), resumed=resumed, model_plan=plan, cause=cause)
 
 
 #: 打ち直しで当て直す拒否 (入口の `CASCADE_*` と同じ規則)。intent の `REOPEN_INTENT_INCOMPLETE` の理由に固定コードで出る
@@ -1420,7 +1538,8 @@ def _unrelease_pairs(closure, cards, graph, path_set):
     return out
 
 
-def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, unreadable, before_write=None):
+def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, unreadable, before_write=None,
+                    cause=None, escalate_model=False, no_escalate=False, model_config=None):
     """`plan.sh reopen`: done / verified / skipped の task I を pending に戻し、`cascade` に従って下流を戻す (設計 §4)。
 
     **検査を全部先に** (何も書かない。拒否は exit 3 + 拒否の行): I の遷移元・試行の記録・active でない・上限、下流の
@@ -1442,6 +1561,13 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     reason = check_reason(reason, 'reason')
     if over_cap is not None:
         over_cap = check_reason(over_cap, 'over_cap')
+    # 差し戻しの種類は必須 (既定に黙って倒さない)。食い違う上書き (mechanical + --escalate-model / quality + --no-escalate) は使い方の誤り
+    if cause not in _model.CAUSES:
+        raise _err(ex.INVALID_ARGUMENT, f"cause は {' / '.join(_model.CAUSES)} のどちらかを必ず指定してください", slug, tid)
+    if escalate_model and no_escalate:
+        raise _err(ex.INVALID_ARGUMENT, "escalate_model と no_escalate は同時に指定できません", slug, tid)
+    if (cause == 'mechanical' and escalate_model) or (cause == 'quality' and no_escalate):
+        raise _err(ex.INVALID_ARGUMENT, f"cause={cause} と {'--escalate-model' if escalate_model else '--no-escalate'} は食い違います", slug, tid)
     _check_now(now)
     if cascade not in CASCADES:
         raise _err(ex.INVALID_ARGUMENT, f"cascade は {' / '.join(CASCADES)} のどれか", slug, tid)
@@ -1567,10 +1693,14 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                     f"続けるなら --over-cap \"<理由>\" を付けてください", slug, tid, meta)
     else:
         done_set = set()
+    # 段上げの決定は検査を全部通った後・intent を書く前に 1 度だけ (起点の card・config をここで読む。回復は intent の値を使う)
+    plan = _model_plan(meta, wants=_model.want_escalation('reopen', cause=cause, escalate_model=escalate_model,
+                                                          no_escalate=no_escalate), model_config=model_config)
     # intent が行う書き込みは全部、実行と同じ関数の dry_run で書く前に通す (台帳の食い違い・遷移・上限。書き込みの種類ごとに
     # 検査を足さない)。戻す task (done_set) も、試行を閉じる task (reset_set) も、I も同じ。1 つでも通らなければ intent を書かない
     _write_reopen(txn, slug, tid, meta, body, kind='reopen', reason=reason, count=meta['execution_count'],
-                  over_cap=over_cap if root_over else None, bump=True, now=now, dry_run=True)
+                  over_cap=over_cap if root_over else None, bump=True, now=now, dry_run=True,
+                  plan=plan, cause=cause, always=True)
     for d in closure:
         if d in done_set:
             card = cards[d][0]
@@ -1590,9 +1720,12 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
         'version': INTENT_VERSION, 'actor': _ledger_actor(txn), 'root': tid, 'root_reopen_count': need, 'reason': reason, 'cascade': cascade,
         'over_cap': over_cap, 'root_capped': bool(root_over), 'created_at': _now_text(now), 'closure': list(closure),
         'unrelease': _unrelease_pairs(closure, cards, graph, set(on_path) | {tid}),
+        'model': {'escalate_to': plan['escalate_to'], 'model_from': plan['model_from'], 'model_escalation': plan['code'],
+                  'at_cap_count': plan['at_cap_count'], 'at_cap_execution': plan['at_cap_execution'], 'cause': cause},
         'tasks': [{'id': d, 'op': 'reset' if d in reset_set else 'reopen', 'capped': bool(_over_cap(cards[d][0], cap_of))}
                   for d in work],
     }
+    _notice(plan)
     txn.write_reopen_intent(slug, intent_name(tid, need), render_intent(intent))
     stale = [d for d in closure if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED) and d not in work]
     # 戻さなかった pending の下流で、I からの経路に「戻さなかった完了済みの中間」を持つもの = I の再完了を待たずに古い結果で走りうる

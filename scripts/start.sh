@@ -734,9 +734,10 @@ else
 fi
 # 使ったモデルの記録 (段上げ PR-1・registry/workers/<Name>/model.json。設計 §4.2)。pull が card の execution_model に写す。
 # mux でも inline でも書く (inline = CREWVIA_MUX_ENABLED=0 も pull する Worker。書く場所を分岐の中に閉じ込めない)。
-# 書けなくても起動は止めない: 記録の無い Worker は execution_model を書かないだけ (割り当ては変わらない)。
-# 同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。mux は「既に居る」(10/11) で終わった呼び出しが
-# 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
+# 書けなければ起動しない (fail-closed。下の関数の中を参照)。同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。
+# mux は「同じ名前の窓が生きているか」を mux_spawn の 1 か所 (10/11) で判定し、空いていると決めた後・起動の直前に
+# --pre-launch-cmd でこの記録を書く。生きた Worker が居れば記録のコマンドは走らず model.json は変わらない。
+# 起動しなかったら自分の記録を消す (退避・復元はしない)。inline は exec の直前に下の関数を呼ぶ。
 _record_worker_model() {
   # 記録は割り当ての根拠 (bound_task / source) なので、書けなければ**常に失敗を返す** (呼び側が起動した Worker を止める = fail-closed)。
   # 束ねの有無で分けない: 書けないまま続行すると、同名の前任の読める記録 (source=env・古い bound_task) が
@@ -1013,39 +1014,33 @@ PYEOF
   # be reported as "already running".  Every other failure — including a
   # relaunch into an empty pane that did not take, after which the name is still
   # in `mux_list` — used to fall into the same message.
-  # model.json は spawn の**前**に書く (設計 §4.2)。窓が見えてから記録までの隙に dispatcher が「記録なし」と見て
-  # 退役させる・前任の記録で誤割り当てする経路を閉じる。書けなければ spawn しない (fail-closed)。
-  # 名前が mux に居る (= 生きた Worker か空の husk かまだ分からない) ときだけ、書く前に前の記録を退避し、
-  # spawn が 10/11 等で起動しなかったら戻す (生きた Worker の記録を上書きしたまま残さない)。
-  _MODEL_REC_FILE=""
-  _MODEL_REC_BACKUP=""
-  _MODEL_REC_RESTORE=0
+  # model.json は spawn が「この名前は空いている」と判断した後・起動する直前に書く (設計 §4.2)。
+  # 窓が見えてから記録までの隙に dispatcher が「記録なし」と見て退役させる・前任の記録で誤割り当てする経路を閉じる。
+  # 「同じ名前の窓が生きているか」の判定は mux_spawn (lib_mux の 4 backend) の 1 か所に任せ、その判定の後に
+  # --pre-launch-cmd で記録を書く。生きた Worker が居れば (10/11) 記録のコマンドは走らず、model.json は 1 バイトも変わらない。
+  # 書けなければ spawn しない (12・fail-closed)。spawn が別の理由で失敗したら、自分が書いた記録を消す
+  # (前の記録は生きた Worker のものではない = 空の窓か居ない名前なので戻さない)。退避・復元はしない。
+  _MODEL_REC_ARGS=()
+  _MODEL_REC_MARK=""
   if [[ "${ROLE}" == "worker" ]]; then
-    _MODEL_REC_FILE="${REPO_ROOT}/registry/workers/${AGENT_NAME}/model.json"
-    _MODEL_REC_RESTORE=1
-    if [[ -f "$_MODEL_REC_FILE" ]]; then
-      _MODEL_REC_BACKUP="$(mktemp 2>/dev/null)" && cp -p "$_MODEL_REC_FILE" "$_MODEL_REC_BACKUP" 2>/dev/null \
-        || { _MODEL_REC_BACKUP=""; echo "[crewvia] WARNING: 既存の model.json を退避できませんでした (起動しなかったときは戻せません)" >&2; }
-    fi
-    if ! _record_worker_model; then
-      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
-      exit 1
-    fi
+    _MODEL_REC_MARK="${TMPDIR:-/tmp}/crewvia-model-rec.$$.$RANDOM"
+    _MODEL_REC_CMD="python3 $(_shq "${SCRIPT_DIR}/lib_worker_model.py") record $(_shq "${REPO_ROOT}/registry") $(_shq "$AGENT_NAME") $(_shq "$SELECTED_MODEL_SOURCE") $(_shq "$SELECTED_MODEL") $(_shq "$BIND_TASK") >/dev/null && : > $(_shq "$_MODEL_REC_MARK")"
+    _MODEL_REC_ARGS=(--pre-launch-cmd "$_MODEL_REC_CMD")
   fi
-  _restore_model_record() {
-    [[ "$_MODEL_REC_RESTORE" -eq 1 ]] || return 0
-    if [[ -n "$_MODEL_REC_BACKUP" ]]; then
-      cp -p "$_MODEL_REC_BACKUP" "$_MODEL_REC_FILE" 2>/dev/null || true
-      rm -f "$_MODEL_REC_BACKUP"
-    else
-      rm -f "${_MODEL_REC_FILE:?}"
-    fi
-  }
   SPAWN_RC=0
-  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" || SPAWN_RC=$?
+  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" "${_MODEL_REC_ARGS[@]+"${_MODEL_REC_ARGS[@]}"}" || SPAWN_RC=$?
+  if [[ -n "$_MODEL_REC_MARK" ]]; then
+    # 記録を書いたのはこの呼び出しのときだけ (マーカーがある)。起動しなかったなら自分の記録を消す。
+    if [[ -e "$_MODEL_REC_MARK" && $SPAWN_RC -ne 0 ]]; then
+      rm -f "${REPO_ROOT:?}/registry/workers/${AGENT_NAME:?}/model.json"
+    fi
+    rm -f "$_MODEL_REC_MARK"
+  fi
   if [[ $SPAWN_RC -ne 0 ]]; then
-    _restore_model_record
     case $SPAWN_RC in
+      12) echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録を書けませんでした (bound_task=${BIND_TASK:-なし}) — 前任の記録が残ると他の task を取りうるので起動しません" >&2
+          _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
+          exit 1 ;;
       10) echo "[crewvia] $WINDOW_NAME is already running — not launching a second one" ;;
       11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
           echo "          確認: mux_capture $WINDOW_NAME (中身が空の shell なら mux_kill $WINDOW_NAME してから再実行)" >&2 ;;
@@ -1081,7 +1076,6 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
-    [[ -n "$_MODEL_REC_BACKUP" ]] && rm -f "$_MODEL_REC_BACKUP"
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。

@@ -267,3 +267,40 @@ _wrap_tmux() {   # _wrap_tmux <new-window/new-session のときに実行する�
     [ "$before" = "$after" ]
     [[ "$after" == *'"bound_task": "m-old/t009"'* ]]
 }
+
+
+# --- attempt 7: 生きているかの判定は mux_spawn の 1 か所・記録はその後・起動の直前 ---
+
+@test "a live window leaves model.json byte-for-byte unchanged and the record command never runs (exit 10/11 path)" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    python3 "${REPO_ROOT}/scripts/lib_worker_model.py" record "${REPO_ROOT}/registry" Ren env opus m-old/t009 >/dev/null
+    f="${REPO_ROOT}/registry/workers/Ren/model.json"
+    before="$(sha256sum "$f")"; mt_before="$(stat -c %Y.%y "$f")"
+    _wrap_tmux 'true' 'case "${1:-}" in list-windows) echo "Ren-worker"; exit 0 ;; esac'
+    run bash "$START_SH" worker --name Ren code python
+    [ "$(sha256sum "$f")" = "$before" ]
+    [ "$(stat -c %Y.%y "$f")" = "$mt_before" ]
+    [[ "$output" == *"already running"* || "$output" == *"could not be read"* ]]
+    [[ "$output" != *"Agent launched"* ]]
+}
+
+@test "when nothing is alive the record exists before the spawn (a fresh name)" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    rm -rf "${REPO_ROOT}/registry/workers/Ren"
+    _wrap_tmux "[ -f \"${REPO_ROOT}/registry/workers/Ren/model.json\" ] && touch \"${BATS_TEST_TMPDIR}/had-record\"" ''
+    run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    [ -f "${BATS_TEST_TMPDIR}/had-record" ]
+    [ -f "${REPO_ROOT}/registry/workers/Ren/model.json" ]
+}
+
+@test "a spawn that fails for another reason removes the record this call wrote (the predecessor's is not restored)" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    python3 "${REPO_ROOT}/scripts/lib_worker_model.py" record "${REPO_ROOT}/registry" Ren env opus m-old/t009 >/dev/null
+    # 窓は居ない (list-windows は空) が new-window が失敗する → 記録は spawn の前に書かれ、失敗で消える
+    _wrap_tmux 'touch "${BATS_TEST_TMPDIR}/hook-ran-before-new-window"; exit 1' ''
+    run bash "$START_SH" worker --name Ren code python
+    [ -f "${BATS_TEST_TMPDIR}/hook-ran-before-new-window" ]
+    [[ "$output" != *"Agent launched"* ]]
+    [ ! -e "${REPO_ROOT}/registry/workers/Ren/model.json" ]
+}

@@ -68,7 +68,7 @@ import threading
 import time
 from collections import namedtuple
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -490,6 +490,30 @@ class _Backend:
     #: caller must not say "already running" about those (t001).
     last_spawn_refusal: Optional[str] = None
 
+    #: Optional caller step run by `spawn()` **after** it has decided the name
+    #: is free (no live occupant; a husk counts as free) and **immediately
+    #: before** it launches anything.  False → nothing is launched and
+    #: `last_spawn_refusal` is `SPAWN_PRELAUNCH_FAILED`.  It exists so a record
+    #: that must be on disk before the window is visible (start.sh's
+    #: `model.json`) is written only for a spawn that is really going to
+    #: happen — never for a call that ends in 10/11, whose live Worker owns
+    #: the existing record.  Reusing spawn's own occupancy decision keeps one
+    #: definition of "already running" across all four backends.
+    pre_launch: Optional[Callable[[], bool]] = None
+
+    def _pre_launch_ok(self, name: str) -> bool:
+        hook = self.pre_launch
+        if hook is None:
+            return True
+        try:
+            ok = bool(hook())
+        except Exception:
+            ok = False
+        if not ok:
+            self._warn(f"spawn {name!r}: the pre-launch step failed; nothing was launched")
+            self.last_spawn_refusal = SPAWN_PRELAUNCH_FAILED
+        return ok
+
     def record_existence(self, name: str, record: dict,
                          timeout: Optional[float] = None) -> str:
         """`PANE_EXISTS` / `PANE_GONE` / `PANE_UNOBSERVED` for the pane
@@ -768,6 +792,9 @@ PANE_IDLE, PANE_LIVE, PANE_UNKNOWN = "idle", "live", "unknown"
 #: that carry them to shell callers (0 = launched, 1 = anything else).
 SPAWN_OCCUPIED, SPAWN_UNREADABLE = "occupied", "unreadable"
 SPAWN_EXIT_OCCUPIED, SPAWN_EXIT_UNREADABLE = 10, 11
+# The caller's pre-launch step (start.sh's model.json write) failed *after* the
+# occupancy check passed and *before* anything was launched: nothing was started.
+SPAWN_PRELAUNCH_FAILED, SPAWN_EXIT_PRELAUNCH_FAILED = "prelaunch_failed", 12
 
 
 def _pane_shell_state(pane_pid, proc_root: str = "/proc") -> str:
@@ -2353,6 +2380,8 @@ class TmuxBackend(_Backend):
                 # `-P -F` so the id comes from the creation itself.  Resolving
                 # it afterwards by name is what let another checkout's window
                 # be recorded as ours (Codex 6巡目 P1-4).
+                if not self._pre_launch_ok(name):
+                    return False
                 r = subprocess.run(
                     ["tmux", "new-session", "-d", "-s", session, "-n", window,
                      "-P", "-F", "#{window_id}"],
@@ -2395,6 +2424,8 @@ class TmuxBackend(_Backend):
                         f"spawn {name!r}: window {inspected_id} holds only an "
                         "idle shell (crashed?) — relaunching in place"
                     )
+                    if not self._pre_launch_ok(name):
+                        return False
                     if not self._send_to_target(inspected_id, cmd, what=name):
                         return False
                     # Before the wait, not after: the window is ours from the
@@ -2405,6 +2436,8 @@ class TmuxBackend(_Backend):
                     return _wait_until_launched(
                         lambda: self._pane_process_state(name, pane_pid),
                         warn=self._warn, name=name)
+                if not self._pre_launch_ok(name):
+                    return False
                 r = subprocess.run(
                     ["tmux", "new-window", "-t", session, "-n", window,
                      "-P", "-F", "#{window_id}"],
@@ -3740,6 +3773,8 @@ class HerdrBackend(_Backend):
                     f"spawn {name!r}: pane {existing_pane_id} is an idle shell "
                     "(herdr restart?) — relaunching in place"
                 )
+                if not self._pre_launch_ok(name):
+                    return False
                 if _herdr_run("pane_run", [existing_pane_id, cmd], timeout=10) is None:
                     self._warn(f"spawn {name!r}: pane run failed on reused pane")
                     return False
@@ -3751,6 +3786,8 @@ class HerdrBackend(_Backend):
                 return True
 
         # tab create.
+        if not self._pre_launch_ok(name):
+            return False
         tab_args = ["--workspace", ws_id, "--label", _pane_name(name), "--no-focus"]
         if cwd:
             tab_args += ["--cwd", cwd]
@@ -5459,6 +5496,8 @@ class RexBackend(_Backend):
 
     def _run_new_block(self, name, cmd, sid, status, cwd=None) -> bool:
         pname = _pane_name(name)
+        if not self._pre_launch_ok(name):
+            return False
         run = ["run", "-s", sid, "--label", pname, "--focus=false",
                "--json"]
         if cwd:
@@ -6261,6 +6300,8 @@ class HcBackend(_Backend):
         if cwd:
             args += ["--cwd", cwd]
         args += ["--json", "--", "bash", "-lc", path_prefix + cmd]
+        if not self._pre_launch_ok(name):
+            return False
         res = _hc_run(args, timeout=15)
         data = _hc_data(res)
         if data is None:
@@ -6499,6 +6540,13 @@ class Mux:
     def server_running(self) -> bool:
         return self._backend.server_running()
 
+    def set_pre_launch(self, hook: Optional[Callable[[], bool]]) -> None:
+        """Install (or clear) the caller step `spawn()` runs once the name is
+        known to be free and just before it launches (see `_Backend.pre_launch`).
+        Not a `spawn()` parameter: the signature is pinned to (name, cmd, cwd)
+        so nothing can hand a spawn an env or a fourth argument by position."""
+        self._backend.pre_launch = hook
+
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
         return self._backend.spawn(name, cmd, cwd=cwd)
 
@@ -6614,8 +6662,26 @@ def _cli_main(args: List[str]) -> int:
         if len(rest) < 2:
             print("Usage: lib_mux.py spawn <name> <cmd> [<cwd>]", file=sys.stderr)
             return 2
+        pre_cmd = None
+        if "--pre-launch-cmd" in rest:
+            i = rest.index("--pre-launch-cmd")
+            if i + 1 >= len(rest) or not rest[i + 1]:
+                print("Usage: lib_mux.py spawn <name> <cmd> [<cwd>] "
+                      "[--pre-launch-cmd <shell command>]", file=sys.stderr)
+                return 2
+            pre_cmd = rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
+        if len(rest) < 2:
+            print("Usage: lib_mux.py spawn <name> <cmd> [<cwd>]", file=sys.stderr)
+            return 2
         name, cmd = rest[0], rest[1]
         cwd = rest[2] if len(rest) >= 3 else None
+        hook = None
+        if pre_cmd is not None:
+            def hook():
+                return subprocess.run(["bash", "-c", pre_cmd], timeout=60,
+                                      stdin=subprocess.DEVNULL).returncode == 0
+        m.set_pre_launch(hook)
         if m.spawn(name, cmd, cwd=cwd):
             return 0
         # 0 = launched, 1 = did not launch, 10/11 = did not launch *because the
@@ -6628,6 +6694,8 @@ def _cli_main(args: List[str]) -> int:
             return SPAWN_EXIT_OCCUPIED
         if refusal == SPAWN_UNREADABLE:
             return SPAWN_EXIT_UNREADABLE
+        if refusal == SPAWN_PRELAUNCH_FAILED:
+            return SPAWN_EXIT_PRELAUNCH_FAILED
         return 1
 
     elif verb == "send":

@@ -412,3 +412,6 @@ local の `director_model` / `worker_model` / `model_per_skill` に版つきの�
 `CREWVIA_WORKER_MODEL` / `CREWVIA_DIRECTOR_MODEL` を付ける (env は config より優先)。どうしても機械ごとに
 変えるときだけ local に書いてよいが、その理由をコメントで残す。確かめ方は
 `CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker <skills>`。参照: `knowledge/model-per-skill.md`・PR #434。
+
+- §4 の allowlist で model 系が「○」になっている行 (`director_model` / `worker_model` / `model_per_skill` / `review`) は、local に書くこと自体は許されている。このため、理由をコメントに残すとき以外は local に書かない、という関係になる。
+- review ブロックのモデル (`review.claude_model` など) も #434 で別名になったので、local の review ブロックに版つきの名前を書くと、同じく版を固定してしまう。

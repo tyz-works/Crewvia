@@ -13,7 +13,7 @@ Controller の公開関数の全引数 (`inspect.signature` から導く。表�
 |---|---|---|
 | reserve_task | txn / slug / tid | `_require_txn` / `_load` (INVALID_ARGUMENT・TASK_NOT_FOUND) |
 |  | agent / now / id_factory | `_check_agent_arg` / `_check_generation` / 候補 ID の形と衝突 |
-| start_execution | execution_id / git_context / now | 形・照合 / `_check_git_context` / `_check_now` |
+| start_execution | execution_id / git_context / now / model | 形・照合 / `_check_git_context` / `_check_now` / 非空白の文字列か None (`INVALID_ARGUMENT`) |
 | complete_execution | caller / to_status / meta_updates / meta_remove / body / now / dry_run | `_check_caller` / 表 / `_check_updates` / `_check_updates` / `_check_body` / `_check_now` / (真偽。書くかどうかだけ) |
 | fail_execution | caller / failure_code / to_status / meta_updates / meta_remove / body / now / dry_run | 同上 + 表 |
 | release_execution | caller / reason_code / to_status / now / meta_updates / body | `_check_caller` / 表 / 表 / `_check_now` / `_check_updates` / `_check_body` |
@@ -40,7 +40,7 @@ X = h.xid(1)
 # 全引数の表に載せた名前 (載っていない引数が増えたら赤)
 _COVERED = {
     "reserve_task": {"txn", "slug", "tid", "agent", "now", "id_factory", "foreign_slot_checked"},
-    "start_execution": {"txn", "slug", "tid", "execution_id", "git_context", "now"},
+    "start_execution": {"txn", "slug", "tid", "execution_id", "git_context", "now", "model"},
     "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "meta_remove", "body", "now",
                            "dry_run", "result_replaced"},     # result_replaced: vNext 02 PR-D (帰属。test_history_ledger_controller.py)
     "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "meta_remove", "body",
@@ -105,6 +105,17 @@ def test_a_bad_now_is_refused_before_the_first_write_in_every_operation(tmp_path
     before = h.snapshot(q)
     with h.tx(q) as t:
         h.raises_code(ex.INVALID_ARGUMENT, call, t, _BAD_NOW[bad])
+    assert h.snapshot(q) == before
+
+
+@pytest.mark.parametrize("bad_model", [object(), 12345, "", "   ", ["opus"], b"opus"])
+def test_a_bad_model_is_refused_before_the_first_write_in_start(tmp_path, bad_model):
+    """start_execution の model は非空白の文字列か None。不正値は書く前に INVALID_ARGUMENT。"""
+    q = h.seed(tmp_path / "q", tids=("t001", "t002"))
+    _reserved(q)
+    before = h.snapshot(q)
+    with h.tx(q) as t:
+        h.raises_code(ex.INVALID_ARGUMENT, lambda t_: ctl.start_execution(t_, MISSION, "t001", X, model=bad_model), t)
     assert h.snapshot(q) == before
 
 

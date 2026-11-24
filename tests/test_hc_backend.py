@@ -337,6 +337,48 @@ def test_spawn_name_taken_is_occupied_refusal(fake):
     assert b.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
 
 
+def _listing(*names):
+    return connect_result("terminal.list", {"hidden_finished": 0, "terminals": [
+        {"name": lib_mux._pane_name(n).lower(),
+         "labels": {"crewvia_name": lib_mux._pane_name(n)}, "state": "live"}
+        for n in names]})
+
+
+def test_hook_does_not_run_when_a_live_terminal_holds_the_name(fake):
+    """attempt 8: 生きた Worker の model.json に hook が触らない (name_taken と同じ 10)。"""
+    ran = []
+    fake.set([_status_rule(), _listing("Omar-worker"),
+              {"match": ["run"], **ok(out=json.dumps({"address": "t7", "state": "live"}))}])
+    b = backend()
+    b.pre_launch = lambda: ran.append(1) or True
+    assert b.spawn("Omar-worker", "true") is False
+    assert ran == []
+    assert b.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
+    assert not any("run" in (c if isinstance(c, list) else c.get("argv", [])) for c in fake.raw_calls()
+                   if isinstance(c, (list, dict)) and "terminal.list" not in json.dumps(c))
+
+
+def test_hook_runs_before_hc_run_when_the_name_is_free(fake):
+    ran = []
+    fake.set([_status_rule(), _listing("Someone-else"),
+              {"match": ["run"], **ok(out=json.dumps({"address": "t7", "state": "live"}))}])
+    b = backend()
+    b.pre_launch = lambda: ran.append(1) or True
+    assert b.spawn("Omar-worker", "true") is True
+    assert ran == [1]
+
+
+def test_unreadable_listing_refuses_before_the_hook(fake):
+    ran = []
+    fake.set([_status_rule(), connect_error("terminal.list", "boom"),
+              {"match": ["run"], **ok(out=json.dumps({"address": "t7", "state": "live"}))}])
+    b = backend()
+    b.pre_launch = lambda: ran.append(1) or True
+    assert b.spawn("Omar-worker", "true") is False
+    assert ran == []
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+
+
 def test_spawn_other_error_is_unreadable_refusal(fake):
     fake.set([_status_rule(), {"match": ["run"], **err_json("spawn_failed")}])
     b = backend()

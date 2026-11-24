@@ -294,13 +294,14 @@ _wrap_tmux() {   # _wrap_tmux <new-window/new-session のときに実行する�
     [ -f "${REPO_ROOT}/registry/workers/Ren/model.json" ]
 }
 
-@test "a spawn that fails for another reason removes the record this call wrote (the predecessor's is not restored)" {
+@test "a spawn that fails for another reason leaves the record this call wrote (attempt 8: a failed spawn may still have started a Worker)" {
     unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
     python3 "${REPO_ROOT}/scripts/lib_worker_model.py" record "${REPO_ROOT}/registry" Ren env opus m-old/t009 >/dev/null
-    # 窓は居ない (list-windows は空) が new-window が失敗する → 記録は spawn の前に書かれ、失敗で消える
     _wrap_tmux 'touch "${BATS_TEST_TMPDIR}/hook-ran-before-new-window"; exit 1' ''
     run bash "$START_SH" worker --name Ren code python
     [ -f "${BATS_TEST_TMPDIR}/hook-ran-before-new-window" ]
     [[ "$output" != *"Agent launched"* ]]
-    [ ! -e "${REPO_ROOT}/registry/workers/Ren/model.json" ]
+    [ -f "${REPO_ROOT}/registry/workers/Ren/model.json" ]
+    # 前任の記録 (m-old/t009) は新しい記録に置き換わっている
+    ! grep -q 'm-old/t009' "${REPO_ROOT}/registry/workers/Ren/model.json"
 }

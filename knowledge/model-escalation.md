@@ -119,7 +119,7 @@
    - `model`: `SELECTED_MODEL`（空 = `--model` なし = CLI の既定は `null`）。
    - `source`: `env`（`WORKER_MODEL_EXPLICIT=1`）/ `override`（§4.3 の束ねた起動で card の `model_override` を使った）/ `skill`（`model_per_skill` か `worker_model`）/ `none`（解決が空）。
    - `bound_task`: `"<slug>/<tid>"` か `null`（§4.3）。
-   - **mux でも inline（`CREWVIA_MUX_ENABLED=0`）でも書く**（mux は `mux_spawn --pre-launch-cmd` で `lib_worker_model.py record` を呼ぶ。「生きているか」の判定は 4 backend の `spawn()` の 1 か所（10/11）で、空いていると決めた後・起動の直前にだけ記録のコマンドが走る。生きた Worker が居れば（10/11）記録のコマンドは走らず `model.json` は 1 バイトも変わらない。書けなければ spawn せず exit 12 → start.sh は起動しない。spawn が別の理由で失敗したら自分が書いた記録を消す。退避・復元はしない。inline は `_record_worker_model` を `exec claude` の前に呼ぶ。同名の先任の記録は丸ごと置き換わる）。`model` は空白だけの文字列も `null` に倒す（Controller の `start_execution` と同じ非空白の基準）。
+   - **mux でも inline（`CREWVIA_MUX_ENABLED=0`）でも書く**（mux は `mux_spawn --pre-launch-cmd` で `lib_worker_model.py record` を呼ぶ。「生きているか」の判定は 4 backend の `spawn()` の 1 か所（10/11）で、空いていると決めた後・起動の直前にだけ記録のコマンドが走る。生きた Worker が居れば（10/11）記録のコマンドは走らず `model.json` は 1 バイトも変わらない。書けなければ spawn せず exit 12 → start.sh は起動しない。spawn が失敗しても記録は消さない（失敗しても Worker が起動していないとは限らない = hc の server identity / write_pane_record の失敗・Rex の block 起動後の失敗。記録は「空きと決めた直後」にしか書かないので、その名前の Worker が居なければ残った記録は誰の許可にもならない）。退避・復元はしない。**hc は `hc run` が name_taken を返す前に hook が走るので、hook の前に `terminal.list` で同じ name の live な terminal を確かめ、居れば hook を走らせず 10（SPAWN_OCCUPIED）で返す**（tmux / herdr / rex は spawn の判定の後に hook を呼ぶ今の順番のまま）。inline は `_record_worker_model` を `exec claude` の前に呼ぶ。同名の先任の記録は丸ごと置き換わる）。`model` は空白だけの文字列も `null` に倒す（Controller の `start_execution` と同じ非空白の基準）。
    - 書き手は start.sh だけ（CLI は新しい lib。§4.3）。原子的に書く（`lib_state_store.atomic_write_text`）。置き場は TARGET_DIR の記録と同じ dir で、**`registry/mux/*.json`（kill の認可の証拠）には相乗りしない**（`lib_worker_target.py` 冒頭と同じ理由）。
 2. **pull** がロック 1 の前に自分（`--agent`）の `model.json` を読み（`lib_daemon_state.load_json_store`。`Unreadable` を `None` に潰さない）、ロック 2 の `start_execution(…, model=…)` に渡す。Controller は card の `execution_model` と record の `model` に書く（`git` と同じ「start が渡したときだけ」）。記録が無い・読めない Worker（PR-1 の前に起動した Worker を含む）は**欄を書かない**（`unknown` のような値を作らない）。
 3. **台帳**: 試行を閉じる遷移（end / reset / retire）と retry / reopen の台帳に `model`（閉じた試行の `execution_model`。無ければ欄なし）を足す（`lib_history.build_event` の引数を 1 つ増やす）。`plan.sh history` と pull の `previous_attempt` に出る。
@@ -378,6 +378,7 @@ PR-1 と PR-2 は独立に revert できる。PR-3 は PR-2 の上でだけ意�
   - 宙に浮いた symlink の `model.json` は `ENOENT` = 「無い」になる（共通の読み口の挙動。target_dir.json と同じ）。実在するファイルへの symlink は中身を読む。
   - PR-1 レビュー（#435 の Seo）の P3 2 件: (a) 退役の表は「task は残っているが `takeable_pending` が空」の意味（`has_any` が偽なら今どおり退役）、(b) 待機のログは原因で文面とキーを分ける（`target_only_<Name>` / `model_rec_unknown_<Name>`）を実装した。
   - **掃除は未決のまま**: Worker が消えても `model.json` は掃除しない（先任の記録が、記録の書き込みに失敗した後任に残りうる）。PR-2 では `bound_task` を持つ記録が残っても、その task が終われば束ねた Worker は退役するので害は小さいと見て入れていない（`sweep_stale_records` を `model.json` に広げるかは PR-3 の前に決める）。
+- **PR-2 attempt 8 の範囲外（P3）**: hc の「名前の使用を確かめる」と `hc run` の間の隙（確かめた後に別の start.sh が同じ名前で起動する）も、下と同じ同時起動の競合として閉じない。
 - **PR-2 attempt 7 の範囲外（P3）**: 2 つの start.sh がほぼ同時に同じ名前で走る競合（両方が「空いている」と判断して両方が記録を書く）は閉じていない。Director の手動起動なので稀。閉じるなら名前ごとの start ロックが要る。
 - Worker のセッションの中で人が `/model` を切り替えた分は記録に入らない（§4.2）。transcript から読む案はあるが、v1 ではやらない。
 - 別名（`opus`）が指す版は CLI の既定で決まるので、台帳の `model: opus` は「その時点の opus」。版まで残したいなら Worker の会話記録の `message.model` を読む必要がある（未確認・v1 ではやらない）。

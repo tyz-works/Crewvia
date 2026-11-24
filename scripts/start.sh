@@ -737,7 +737,7 @@ fi
 # 書けなければ起動しない (fail-closed。下の関数の中を参照)。同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。
 # mux は「同じ名前の窓が生きているか」を mux_spawn の 1 か所 (10/11) で判定し、空いていると決めた後・起動の直前に
 # --pre-launch-cmd でこの記録を書く。生きた Worker が居れば記録のコマンドは走らず model.json は変わらない。
-# 起動しなかったら自分の記録を消す (退避・復元はしない)。inline は exec の直前に下の関数を呼ぶ。
+# 起動に失敗しても記録は消さない (退避・復元もしない)。inline は exec の直前に下の関数を呼ぶ。
 _record_worker_model() {
   # 記録は割り当ての根拠 (bound_task / source) なので、書けなければ**常に失敗を返す** (呼び側が起動した Worker を止める = fail-closed)。
   # 束ねの有無で分けない: 書けないまま続行すると、同名の前任の読める記録 (source=env・古い bound_task) が
@@ -1018,24 +1018,16 @@ PYEOF
   # 窓が見えてから記録までの隙に dispatcher が「記録なし」と見て退役させる・前任の記録で誤割り当てする経路を閉じる。
   # 「同じ名前の窓が生きているか」の判定は mux_spawn (lib_mux の 4 backend) の 1 か所に任せ、その判定の後に
   # --pre-launch-cmd で記録を書く。生きた Worker が居れば (10/11) 記録のコマンドは走らず、model.json は 1 バイトも変わらない。
-  # 書けなければ spawn しない (12・fail-closed)。spawn が別の理由で失敗したら、自分が書いた記録を消す
-  # (前の記録は生きた Worker のものではない = 空の窓か居ない名前なので戻さない)。退避・復元はしない。
+  # 書けなければ spawn しない (12・fail-closed)。spawn が失敗しても記録は消さない: 失敗しても Worker が起動していないとは
+  # 限らない (hc の server identity / write_pane_record の失敗・Rex の block 起動後の失敗)。記録は「空きと決めた直後」にしか
+  # 書かないので、その名前の Worker が居なければ残った記録は誰の許可にもならない (設計 §4.2・§12)。退避・復元・印の一時ファイルは持たない。
   _MODEL_REC_ARGS=()
-  _MODEL_REC_MARK=""
   if [[ "${ROLE}" == "worker" ]]; then
-    _MODEL_REC_MARK="${TMPDIR:-/tmp}/crewvia-model-rec.$$.$RANDOM"
-    _MODEL_REC_CMD="python3 $(_shq "${SCRIPT_DIR}/lib_worker_model.py") record $(_shq "${REPO_ROOT}/registry") $(_shq "$AGENT_NAME") $(_shq "$SELECTED_MODEL_SOURCE") $(_shq "$SELECTED_MODEL") $(_shq "$BIND_TASK") >/dev/null && : > $(_shq "$_MODEL_REC_MARK")"
+    _MODEL_REC_CMD="python3 $(_shq "${SCRIPT_DIR}/lib_worker_model.py") record $(_shq "${REPO_ROOT}/registry") $(_shq "$AGENT_NAME") $(_shq "$SELECTED_MODEL_SOURCE") $(_shq "$SELECTED_MODEL") $(_shq "$BIND_TASK") >/dev/null"
     _MODEL_REC_ARGS=(--pre-launch-cmd "$_MODEL_REC_CMD")
   fi
   SPAWN_RC=0
   mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" "${_MODEL_REC_ARGS[@]+"${_MODEL_REC_ARGS[@]}"}" || SPAWN_RC=$?
-  if [[ -n "$_MODEL_REC_MARK" ]]; then
-    # 記録を書いたのはこの呼び出しのときだけ (マーカーがある)。起動しなかったなら自分の記録を消す。
-    if [[ -e "$_MODEL_REC_MARK" && $SPAWN_RC -ne 0 ]]; then
-      rm -f "${REPO_ROOT:?}/registry/workers/${AGENT_NAME:?}/model.json"
-    fi
-    rm -f "$_MODEL_REC_MARK"
-  fi
   if [[ $SPAWN_RC -ne 0 ]]; then
     case $SPAWN_RC in
       12) echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録を書けませんでした (bound_task=${BIND_TASK:-なし}) — 前任の記録が残ると他の task を取りうるので起動しません" >&2

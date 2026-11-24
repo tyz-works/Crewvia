@@ -6300,6 +6300,22 @@ class HcBackend(_Backend):
         if cwd:
             args += ["--cwd", cwd]
         args += ["--json", "--", "bash", "-lc", path_prefix + cmd]
+        if self.pre_launch is not None:
+            # 記録を書く hook の前に「同じ名前の live な terminal が居るか」を確かめる。居れば hook を走らせず
+            # name_taken (hc run の拒否) と同じ SPAWN_OCCUPIED で返す = 生きた Worker の記録に触らない。
+            # 確かめと hc run の間の隙は残る (同時起動の競合と同じ P3。設計 §12)。
+            listed, reason = _hc_connect("terminal.list", {"all": False}, timeout=10)
+            terminals = listed.get("terminals") if isinstance(listed, dict) else None
+            if not isinstance(terminals, list):
+                self._warn(f"spawn {name!r}: could not list hc terminals ({reason}); nothing was launched")
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            want_name = _pane_name(name)
+            for t in terminals:
+                labels = t.get("labels") if isinstance(t, dict) else None
+                if isinstance(labels, dict) and labels.get("crewvia_name") == want_name:
+                    self.last_spawn_refusal = SPAWN_OCCUPIED
+                    return False
         if not self._pre_launch_ok(name):
             return False
         res = _hc_run(args, timeout=15)

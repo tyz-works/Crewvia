@@ -202,7 +202,7 @@ def recover_intents(queue):
 
 def run_reopen(queue, graph, cascade, *, unreadable=()):
     with h.tx(queue, op="reopen", actor="Director") as txn:
-        return ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON, cascade=cascade,
+        return ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON, cause="mechanical", cascade=cascade,
                                graph={t: list(d) for t, d in graph.items()}, unreadable=list(unreadable), now=T2)
 
 

@@ -59,8 +59,10 @@ def finish_all(box, tids):
         finish(box, tid)
 
 
-def reopen(box, tid="t001", *extra, reason=REASON, branch="reuse", agent="Director"):
+def reopen(box, tid="t001", *extra, reason=REASON, branch="reuse", agent="Director", cause="mechanical"):
     args = ["reopen", tid, "--mission", MISSION]
+    if cause is not None:
+        args += ["--cause", cause]
     if reason is not None:
         args += ["--reason", reason]
     if branch is not None:
@@ -200,7 +202,7 @@ def test_reopen_of_an_archived_mission_is_refused_with_exit_3(tmp_path):
     for extra in ((), ):
         q = reopen(box)
         assert q.returncode == 3 and last_error_code(q.stderr) == "MISSION_ARCHIVED", q.stderr
-    q = run(box, "reopen", "t001", "--reason", REASON, "--branch", "reuse", agent="Director")   # --mission なしでも
+    q = run(box, "reopen", "t001", "--reason", REASON, "--branch", "reuse", "--cause", "mechanical", agent="Director")   # --mission なしでも
     assert q.returncode == 3 and last_error_code(q.stderr) == "MISSION_ARCHIVED", q.stderr
     assert box.snapshot() == before
 

@@ -27,6 +27,14 @@
 
 `worker_model` フォールバック = `config/crewvia.yaml` の `worker_model` 値（デフォルト `sonnet`）。
 
+### 差し戻しでの自動の段上げ（モデルの段上げ PR-3。設計 `knowledge/model-escalation.md`）
+
+上の表は**既定**のモデル。実装 task が品質で差し戻されたときだけ、その task の `model_override` を 1 段上げる（haiku → sonnet → opus）。
+- `plan.sh reopen --cause quality`（設計の誤り・考え不足・要件の取り違え）と `verify-result fail`（`--no-escalate` で止める）で上がる。`--cause mechanical`（CI の赤・テストの書き方・細かい境界値）と、フラグ無しの `retry` は上がらない（`retry --escalate-model` のときだけ）。
+- review / qa / codex-review の task と、cascade で戻る下流は上げない（`lib_model.escalation_applicable`）。
+- 起点は閉じた試行の実際のモデル（`execution_model`）→ 今の `model_override` → この表の既定。opus での差し戻しが 2 回目になると dispatcher が Director に `[model-at-cap]` を 1 回送る。
+- 上がった task は束ねた Worker（`CREWVIA_BIND_TASK`。dispatcher の `no_worker` 通知の起動コマンド）だけが取る。この表と `CREWVIA_WORKER_MODEL` の優先順位は変わらない。
+
 ---
 
 ## 複数 skill 指定時のルール

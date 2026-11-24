@@ -175,7 +175,7 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     expected.append(("reap-orphan-assignment", "t004", None, None))
 
     # vNext 02 PR-F: reopen (理由は台帳にだけ書く)
-    sb.run("reopen", "t004", "--reason", SECRET_REASON, "--branch", "reuse", "--cascade", "none")
+    sb.run("reopen", "t004", "--reason", SECRET_REASON, "--branch", "reuse", "--cause", "mechanical", "--cascade", "none")
     expected.append(("reopen", "t004", "done", "pending"))
 
     sb.run("update", "t002", "--status", "skipped")

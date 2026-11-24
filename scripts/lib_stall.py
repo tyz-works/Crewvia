@@ -119,7 +119,7 @@ def message(slug, stall, elapsed_seconds):
     return (f'[stall] mission {slug} が{how_long} (進行中の task も、割り当てられる pending も 0 件)。'
             f'止まっている task: {items}。{last}'
             f'出口: `plan.sh status --mission {slug}` で確認し、`plan.sh update <id> --status pending` で戻す / '
-            f'`plan.sh reopen <id> --reason ... --branch reuse` で直す / 不要なら skipped にしてください。')
+            f'`plan.sh reopen <id> --reason ... --branch reuse --cause quality|mechanical` で直す / 不要なら skipped にしてください。')
 
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,8 @@
 
 | コマンド | 既定 | 理由 |
 |---|---|---|
-| `plan.sh reopen <I>`（I が実装 task） | **上げる**（起点 I だけ） | §2.4 のとおり、review / QA / Codex の所見で実装 task を戻す経路はこれだけ。reopen の遷移元は done / verified / skipped で、「終わったと思った結果が足りなかった」以外に打つ理由が無い |
+| `plan.sh reopen <I> --cause quality`（I が実装 task） | **上げる**（起点 I だけ） | **11-24 追記: reopen は差し戻しの種類 `--cause quality\|mechanical` が必須**（無い・他の値は exit 3・何も書かない）。quality = 設計の誤り・考え不足・要件の取り違え。実装の既定は sonnet なので機械的な差し戻しまで上げると 1 回で opus になり、opus での 2 回目の通知が日常的に出る（11-24 の実績では reopen の約半分が機械的）ため、「reopen は既定で上げる」を「種類で決める」に置き換えた |
+| `plan.sh reopen <I> --cause mechanical` | **上げない** | CI の赤・構造ガード・テストの書き方（fixture・表の行の足し忘れ等）・細かい境界値や入力検査の追加。台帳には `cause: mechanical` / `model_escalation: declined` が残る |
 | `plan.sh reopen <I>`（I の skills が `lib_dep_rules.CASCADE_REVIEW_SKILLS` = review / qa / codex-review のどれかを含む） | **上げない**（`--escalate-model` でも上げない。警告 `MODEL_ESCALATION_NOT_APPLICABLE`） | **段上げは実装 task だけ**。review / QA を戻すのは「見直してほしい」であって、その task の出来が品質不足と判定されたのではない（判定したのは自分自身）。集合は `CASCADE_REVIEW_SKILLS` を import する（新しい集合を作らない） |
 | reopen の cascade で戻る下流（review / qa / codex-review・経路の中間） | **上げない** | 古い実装の上の作業だから戻すだけで、その task の品質が足りなかったわけではない（§11-8 = a） |
 | `plan.sh verify-result fail`（< `max_rework`。task は直接 pending に戻る） | **上げる**（§11-1 = a） | 検証者が出来を断った = 品質由来で、固定コード `VERIFICATION_REJECTED` で言い切れる唯一の終わり方。Controller の `fail_execution(VERIFICATION_REJECTED)` の **同じ書き込み**で `model_override` を付ける（card の pending と別の書き込みにしない）。`--no-escalate` で止められる |
@@ -103,7 +104,7 @@
 | どのコマンドでも `--escalate-model` | 上げる | 終わり方で判別できない品質由来（Worker が自分で `fail` した等）を Director が明示する |
 | どのコマンドでも `--no-escalate` | 上げない | 指摘が軽い・モデルのせいでないと Director が判断したとき |
 
-- `--escalate-model` と `--no-escalate` は同時に渡せない（UsageExit・何も書かない）。
+- `--escalate-model` と `--no-escalate` は同時に渡せない（exit 3・何も書かない）。**`--cause` と食い違う上書き（`mechanical` + `--escalate-model`・`quality` + `--no-escalate`）も使い方の誤りとして exit 3**。上げるかの判定は `lib_model.want_escalation`（求めているか）と `escalation_applicable(skills)`（適用できるか）の 1 か所の表で決める（`decide_escalation`）。
 - **判別は固定コード（`execution_end_code`）だけで行う**。Result・理由・needs_director_reason の文面は読まない（文面の判定は `lib_verdict` の経緯のとおり、否定形と場所の無限集合に負ける）。
 - codex-review の task（skills に `codex-review`）は kai-review.sh が走らせ、Claude Worker のモデルを使わない。**この task には `model_override` を書かない**（フラグで明示されても `MODEL_ESCALATION_NOT_APPLICABLE` で警告して書かない。reopen / retry 自体は止めない）。上の `CASCADE_REVIEW_SKILLS` の行に含まれる。
 - 「実装 task か」の判定は 1 関数 `lib_model.escalation_applicable(skills)`（= skills が `CASCADE_REVIEW_SKILLS` と交わらない）。reopen・verify-result fail・retry の 3 つの入口が全部これを通す。
@@ -209,7 +210,7 @@
 | 割り当ての規則（dispatcher と pull の共有・不変条件 5） | 新しい共有規則 `lib_worker_model.worker_may_take`。**env の停止スイッチを付けない** | **要る**（割り当ての判定が変わる） |
 | 試行の記録の形（`lib_execution.record_shape_problem`） | 任意の欄 `model`（`None` か文字列）を足す。`RECORD_SCHEMA_VERSION` は上げない（旧コードは知らない欄を読まない） | 要る（record の形） |
 | 台帳の欄（`lib_history`）・再送の比較（`HISTORY_MISMATCH`） | `model`・`model_from`・`model_to`・`model_escalation` を足す。再送の比較に**含める**（同じ再送なら同じ値になる。§6） | 要る |
-| reopen の intent（`reopen-intents/`・`parse_reopen_intent`） | `parse_reopen_intent`（`scripts/lib_task_controller.py:1130`）は欄の集合を**厳密に照合**する（`set(data) != _INTENT_KEYS or data['version'] != INTENT_VERSION` → `shape`）。だから欄を足すだけでは旧コードも新コードも割れる。**`INTENT_VERSION` を 2 に上げ、v2 の intent に欄 `model`（`{"escalate_to": <別名>|null, "model_escalation": <コード>, "at_cap_count": <int>, "at_cap_execution": <ex-…>|null}`。中の欄も集合を厳密に照合する）を足す**。新しいコードは **v1（欄なし = 段上げしない）と v2 の両方を受ける**（v1 は `_INTENT_KEYS` と完全一致、v2 は `_INTENT_KEYS ∪ {'model'}` と完全一致。版ごとに集合を持つ表 `_INTENT_KEYS_BY_VERSION`）。旧コードは v2 を `shape` で拒否する（= `REOPEN_INTENT_INCOMPLETE`。その mission の pull だけ止まる。§9） | **要る**（intent の形・版が変わる） |
+| reopen の intent（`reopen-intents/`・`parse_reopen_intent`） | `parse_reopen_intent`（`scripts/lib_task_controller.py:1130`）は欄の集合を**厳密に照合**する（`set(data) != _INTENT_KEYS or data['version'] != INTENT_VERSION` → `shape`）。だから欄を足すだけでは旧コードも新コードも割れる。**`INTENT_VERSION` を 2 に上げ、v2 の intent に欄 `model`（`{"escalate_to": <別名>|null, "model_from": <別名>|null, "model_escalation": <コード>, "at_cap_count": <int>, "at_cap_execution": <ex-…>|null, "cause": "quality"|"mechanical"}`。中の欄も集合を厳密に照合する。`cause` と `model_from` は 11-24 の追記と台帳のために足した）を足す**。新しいコードは **v1（欄なし = 段上げしない）と v2 の両方を受ける**（v1 は `_INTENT_KEYS` と完全一致、v2 は `_INTENT_KEYS ∪ {'model'}` と完全一致。版ごとに集合を持つ表 `_INTENT_KEYS_BY_VERSION`）。旧コードは v2 を `shape` で拒否する（= `REOPEN_INTENT_INCOMPLETE`。その mission の pull だけ止まる。§9） | **要る**（intent の形・版が変わる） |
 | card の欄 `model_at_cap_count` / `model_at_cap_execution` | §4.6 の通知の数と fingerprint。`TASK_META_KEY_ORDER` に `model_override` の直後 | 要る（card の形） |
 | `_INTENT_FREEZE` | 新しいサブコマンド `model-for` は読み取り専用 = `allow` に載せる（載せないと構造テストが赤） | 不要（表の更新だけ） |
 | start.sh の起動（`LAUNCH_CMD`・`_shq`） | `--model` の値の出どころが増えるだけ。埋め込みは今の `_shq` を通す | 不要 |
@@ -238,7 +239,7 @@ CREWVIA_WORKER_MODEL（起動前に人が設定。WORKER_MODEL_EXPLICIT=1）
 
 **opus での差し戻しが 2 回目になったら Director に 1 回通知（§11-3 = b）:**
 
-- **数える**: 段上げが適用される差し戻し（§4.1 で「上げる」になった reopen・verify-result fail・`retry --escalate-model`）のうち、起点がもう opus で `model_escalation: at_cap` になったものだけを、card の `model_at_cap_count` に +1 する（`model_override` / pending と**同じ書き込み**。reopen は intent の `model.at_cap_count` に決めた値を書き、回復はその値を写す = 数え直さない）。`--no-escalate`・適用外（review / qa / codex-review・`update --reset`・フラグなしの retry）は数えない。sonnet → opus に上がった回は 0 回目（at_cap ではない）。
+- **数える**: 段上げが適用される差し戻し（§4.1 で「上げる」になった reopen（**`--cause quality` だけ**。mechanical は数えない）・verify-result fail・`retry --escalate-model`）のうち、起点がもう opus で `model_escalation: at_cap` になったものだけを、card の `model_at_cap_count` に +1 する（`model_override` / pending と**同じ書き込み**。reopen は intent の `model.at_cap_count` に決めた値を書き、回復はその値を写す = 数え直さない）。`--no-escalate`・適用外（review / qa / codex-review・`update --reset`・フラグなしの retry）は数えない。sonnet → opus に上がった回は 0 回目（at_cap ではない）。
 - **出す人**: dispatcher（Director の画面に届く唯一の常駐者。reopen の出力は打った本人の画面に出るだけで、verify-result fail を打つのは verifier）。サイクルごとに読む card の `model_at_cap_count >= 2` を見て `notify_state_once` で送る。plan.sh は通知を送らない（今の作法どおり。出力に「次に dispatcher が通知します」と 1 行）。
 - **台帳のキー**: `model-at-cap-<slug>-<tid>`（task ごとに 1 つ・`notified-state.json`）。fingerprint は card の `model_at_cap_execution` = **数が 2 になった差し戻しで閉じた試行の `execution_id`**（Controller が +1 の書き込みで数が ちょうど 2 になったときだけ書く。3 回目以降は書き換えない）。`reopen_count` を fp にしない（verify-result fail・retry では動かないので、数え直した後の 2 回目を見分けられない）。
 - **1 回だけの規則**: 1 つの task につき、`model_at_cap_count` が 2 に達した時点の 1 回だけ送る。3 回目以降の差し戻しでは**送らない**（fp が変わらない。「設計を見直すきっかけ」は 1 回で足りる・毎回送ると差し戻しの度にうるさい）。台帳を消したら次のサイクルでもう一度 1 回届く（消してよい台帳の作法どおり・不変条件 7）。`update --model-override none` は `model_at_cap_count` と `model_at_cap_execution` も消す = 数え直し（次に 2 に達したら別の試行の ID が fp になり、もう一度 1 回届く）。
@@ -265,7 +266,8 @@ CREWVIA_WORKER_MODEL（起動前に人が設定。WORKER_MODEL_EXPLICIT=1）
 | Worker の `model.json` が無い | `model_override` の無い task は取れる・ある task は取らない（§4.3 の表）。override の task しか残らなければ**退役でよい**（§4.3 の 5。永久に取れないので待つ理由が無い） | PR-1 の前に起動した Worker を止めない（`lib_worker_target` と同じ向き） |
 | `model.json` が読めない・壊れている（missing でない） | 「無い」と同じ扱い**ではない**: 束ねられているか分からないので、`model_override` の無い task も**取らない**（保留）+ dispatcher のログに 1 回。**退役もさせない（待機）**（§4.3 の 5。`_rec_known` と同じ） | 束ねた Worker が別の task を取るのを防ぐ側。かつ観測できなかったことを根拠に破壊（退役）しない。`is_missing` と壊れたを取り違えない（memory `load-json-store-missing-is-also-unreadable`） |
 | 前の試行の `execution_model` が無い・知らない名前（`fable` 等の段に無いモデル） | 起点を `model_override` → 既定モデルの順に探す（§4.2） | 起点が分からないことを理由に段上げを止めない |
-| 既定モデルも決められない（config が `Unreadable`） | **reopen / retry / verify-result fail は進める・段上げはしない**・stderr に固定コード `MODEL_ESCALATION_SKIPPED:config_unreadable`・台帳に `model_escalation: skipped:config_unreadable` | 差し戻しは Director の主要な出口で、config の壊れで止めると出口が消える（§11-4 = a） |
+| 既定モデルも決められない（config が**無い**・`worker_model` / `model_per_skill` の**値の型が違う**（数値・list 等。`lib_model.default_model` が例外にせず `config_unreadable` を返す）） | **reopen / retry / verify-result fail は進める・段上げはしない**・stderr に固定コード `MODEL_ESCALATION_SKIPPED:config_unreadable`・台帳に `model_escalation: skipped:config_unreadable` | 差し戻しは Director の主要な出口で、モデルの値の不備で止めると出口が消える（§11-4 = a） |
+| **YAML として壊れた** config（`crewvia.yaml` / `crewvia.local.yaml`） | **reopen / retry は段上げの判定より前**に既存の `attempts.max_total` の読み込み（`_default_cap_or_refuse`）で **exit 1・何も書かずに断る**（既存の「壊れた config は既定値に倒さない」規則。出口は local.yaml を直すか一時的に退避）。**verify-result fail は進む**（総試行数の上限を読まないので `skipped:config_unreadable` で進む） | §11-4 の (a) は「モデルの値が決められない」場合の規則。YAML の壊れは上限の読み込みという別の既存規則が先に断るので、段上げのために新しい例外を作らない（attempt 2・Director の選択 = 案 a） |
 | reopen の intent が v1（PR-3 の前に書かれ、完了していない） | 新しいコードが**段上げなしで完了させる**（`model` 欄が無い = 段上げしない。v1 の時点の決定には段上げが含まれていない）。`model_at_cap_count` も触らない | 決定のコミット点は intent。回復で決定を足さない（「一覧を作り直さない」と同じ原則） |
 | `CREWVIA_BIND_TASK` の値が壊れている・card が無い・`model-for` が exit 1 | start.sh は**起動しない**（exit 1・`logs/start-sh/refusals.log`） | 束ねの無い Worker が起動して普通に task を取るより安全 |
 | 明示 env の値が段に無い名前 | 今どおり（`lib_model` の警告だけ・そのまま `--model` に渡す）。記録には書く | 人の明示は通す（今の挙動） |
@@ -284,7 +286,7 @@ CREWVIA_WORKER_MODEL（起動前に人が設定。WORKER_MODEL_EXPLICIT=1）
    - **読み口は v1 と v2 の両方を受ける**: `parse_reopen_intent` は `data['version']` で欄の集合（`_INTENT_KEYS_BY_VERSION[1]` = 今の `_INTENT_KEYS`・`[2]` = それ ∪ `{'model'}`）を選んで厳密に照合する。知らない版（3 以上・0・bool）は今どおり `shape`。v1 は `model` 欄なし = **段上げしない**で完了させる（§4.8）。
    - 書き手は常に v2（v1 を書く経路を残さない）。
    - 旧コード（PR-3 より前）は v2 を `shape` で拒否する（`REOPEN_INTENT_INCOMPLETE`・その mission の pull が止まる）。だから PR-3 の revert の前に未完の v2 の intent を完了させる（§9）。
-3. 台帳（I の reopen に `model_from` / `model_to` / `model_escalation`）→ I の card（`model_override`・`model_at_cap_count`・`model_at_cap_execution` は `status: pending` と**同じ書き込み**。別の書き込みにしない = 途中で止まっても「pending だが override が無い」が生まれない）→ intent を消す。
+3. 台帳（I の reopen に `model_from` / `model_to` / `model_escalation` / `cause`）→ I の card（`model_override`・`model_at_cap_count`・`model_at_cap_execution` は `status: pending` と**同じ書き込み**。別の書き込みにしない = 途中で止まっても「pending だが override が無い」が生まれない）→ intent を消す。
 4. dry_run（fix 6 / t072）にも同じ引数を通す（`_write_reopen(dry_run=True)` の台帳の比較に `model_*` が入る）。
 
 **verify-result fail（PR-3）:** 今の `fail_execution(VERIFICATION_REJECTED)` の順（台帳 → card → 枠）のまま、台帳に `model_*`、card の pending の書き込みに `model_override`（と §4.6 の欄）を載せる。段上げの値は検査の段階（ロックの中・書く前）で決める。再送は台帳の比較に `model_*` が入る。
@@ -362,13 +364,16 @@ PR-1 と PR-2 は独立に revert できる。PR-3 は PR-2 の上でだけ意�
 | 1 | 検証の差し戻しと retry | **(a)** `verify-result fail`（task が直接 pending に戻る）でも上げる。retry は既定で上げず、`--escalate-model` のときだけ上げる | (b) verify-result fail も上げない（決定 (A) の文面どおり review / QA / Codex だけ）／(c) (a) に加え retry の `WORKER_FAILED` も上げる | §0・§4.1・§6・§8 |
 | 2 | Codex の NEEDS FIX の後 | **(a)** 正しい出口は実装 task の reopen（= 上がる）。codex-review task 自体の retry（Codex を走らせ直す）は上げない | (b) needs-director の codex-review task の retry で上流の実装 task にも override を付ける | §4.1 |
 | 3 | opus で再び差し戻されたとき | **(b)** opus での差し戻しが 2 回目になったら Director に 1 回通知（止めない・理由も求めない） | (a) opus のまま黙って続ける（`at_cap` だけ）／(c) opus での差し戻しは `--over-cap` と同じく理由を必須にする | §0・§4.4・§4.6・§8 |
-| 4 | 既定モデルが決められない（config が壊れている）ときの差し戻し | **(a)** 差し戻しは進め、段上げだけ飛ばす | (b) reopen を断る（`--no-escalate` を付ければ通る） | §4.8 |
+| 4 | 既定モデルが決められない（config が壊れている）ときの差し戻し | **(a)** 差し戻しは進め、段上げだけ飛ばす | (b) reopen を断る（`--no-escalate` を付ければ通る） | §4.8 | 注 (attempt 2): (a) が及ぶのは config が無い・モデルの値の型違い。YAML として壊れた config は reopen / retry が `attempts.max_total` の読み込みで先に断る（§4.8）。
 | 5 | 最初から上げた状態で task を作れるようにするか | **(a)** `add` は受け付けない。`update --model-override` は Director の手で使える | (b) `add --model-override` も受け付ける | §4.4 |
 | 6 | task-graph に出すか | **(a)** 出さない | (b) 表示名の末尾に `[opus↑]` | §4.7 |
 | 7 | 束ねた Worker の起動 | **(a)** 今の運用どおり Director が通知のコマンドを貼って起動する | (b) dispatcher が自分で起動する（別の設計・範囲外） | §4.3 |
 | 8 | cascade で戻る下流の review の扱い | **(a)** 上げない（review / plan_review / research は既に opus。qa / verify は sonnet） | (b) 実装 task の `model_override` 以上に下流の review も揃える | §4.1 |
+| 9 | reopen の段上げの既定（11-24 追記 2） | **種類で決める**: `plan.sh reopen --cause quality\|mechanical` を必須にし、quality だけ上げる。`--escalate-model` / `--no-escalate` は例外の上書き | 「reopen は既定で上げる」（初版の §4.1）・`--no-escalate` を機械的な直しのたびに付ける運用 | §4.1・§4.4・§4.6・§6 |
 
 ## 12. 未解決の課題（この文書のレビューで積む場所）
+
+- **PR-3 実装メモ（2026-11-24）**: 決定の本体は `lib_model.decide_escalation`（Controller は `_model_plan` で呼ぶだけ）。台帳の `model_escalation` の値は `escalated` / `at_cap` / `declined` / `not_applicable` / `skipped:config_unreadable` / `skipped:no_base`。reopen の根は常に `model_escalation` と `cause` を残し、verify-result fail / retry は declined 以外のときだけ。`retry` / `verify-result` の出力の「モデル: X → Y」は書いた後の card の `model_override` の差から作る（元が既定のときは「既定 → opus」）。
 
 - **PR-1 実装メモ（2026-11-24）**: `plan.sh` の `lib_task_cards` は `_load_scripts_module` で別に読み込まれ、`lib_worker_model` が import する `lib_task_cards` とは**別のモジュール**。呼び出し側が `is_missing()` / `is_unreadable()` を取り違える（isinstance が偽になり `rec['model']` が TypeError）ので、「無い / 読めない / 値」の判定は `lib_worker_model.recorded_model()` に閉じた。PR-2 の `worker_may_take` も plan.sh から呼ぶなら同じ形（判定を lib の中で済ませる）にする。
 - PR-1 の限界: Worker が消えても `model.json` は掃除しない（`lib_worker_target.sweep_stale_records` は `target_dir.json` だけ見る）。後任の `start.sh` が置き換えるので害は無いが、記録の書き込みに失敗した後任には先任の記録が残りうる。PR-2 で `worker_may_take` が読むようになる前に、掃除に `model.json` を含めるか決める。

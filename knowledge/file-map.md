@@ -488,6 +488,7 @@ Worker が起動されたときのモデルの記録の唯一の定義（モデ�
 card の `execution_model`・record の `model`・pull の JSON・台帳の `model`（閉じた試行の分）・
 `previous_attempt.model`・`plan.sh status` の `model=` に写す。**記録が無い・読めない・モデルが空の Worker では欄を書かない**
 （`unknown` を作らない）。**PR-2 で割り当ての判定 `worker_may_take(record, task_meta, slug)`（設計 §4.3 の表。dispatcher と plan.sh pull が共有・`worker_may_take_for` は記録の読み込みごと lib の中）と `override_of`（card の `model_override`）が加わった**。別名の段は `lib_model.ESCALATION_LADDER`。
+**PR-3 で差し戻しの自動の段上げが加わった**: 判定の表は `lib_model`（`want_escalation` / `decide_escalation` / `escalation_applicable`）の 1 か所、書き手は Controller（`_model_plan`。reopen の intent は版 2 で `model` 欄・v1 互換）、通知は dispatcher の `model-at-cap`。契約は `scripts/CLAUDE.md`「モデルの段上げ PR-3」・設計 `knowledge/model-escalation.md` §4.1・§6。
 後任の `start.sh` が記録を置き換える（書けなかったときだけ先任の記録が残りうる = 既知の限界）。停止スイッチは無い。
 CLI: `record <registry_dir> <agent> <source> [<model> [<bound_task>]]` / `show`。
 設計: `knowledge/model-escalation.md`

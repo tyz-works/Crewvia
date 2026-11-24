@@ -323,7 +323,7 @@ required_evidence:
 |---|---|
 | failed / needs_director / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`）。試行が active（reserved / running）なら `ATTEMPT_ACTIVE`、試行の記録が無い card と retry の遷移元でない status は `RETRY_NOT_ALLOWED`（どちらも `update --reset` を使う）。**`needs_human_review`（verify-result 由来）は retry できない**: 試行が `running` のまま残り `ATTEMPT_ACTIVE` になる。しかも `update --close-execution` は DETACHED の試行しか閉じないので `INVALID_TRANSITION` で拒否される（sandbox で確認済み）。出口は `update --status pending --reset` だけ（台帳には `reset` / `RESET_BY_DIRECTOR` が残り、理由は残らない。理由は次の Worker への指示か card の Result に書く） |
 | 理由が要らない差し戻し・壊れた card の出口・pull 前に落ちた予約 | `plan.sh update <id> --status pending --reset`（従来どおり。台帳に理由が残らない） |
-| done / verified の**実装 task**に Codex・QA の指摘を直させる | `plan.sh reopen <impl> --reason "<指摘の要約>" --branch reuse --cascade reviews --mission <slug>` |
+| done / verified の**実装 task**に Codex・QA の指摘を直させる | `plan.sh reopen <impl> --reason "<指摘の要約>" --branch reuse --cause quality|mechanical --cascade reviews --mission <slug>`（**`--cause` は必須**。下の「モデルの段上げ」） |
 
 `reopen` の挙動（実装 `lib_task_controller.py` / `scripts/CLAUDE.md`「reopen と下流の無効化」で確認）:
 - 実装 task が pending に戻り、`blocked_by` が付いたままの review / QA は**依存で待つ**。fix task を足して `blocked_by` を後から付け替える必要は無い（再確認が fix より先に pull される事故も起きない）。実装が再び done になれば、同じ PR 番号のまま review・QA が pull できる。
@@ -334,6 +334,15 @@ required_evidence:
 - **PR が merge 済みの task は reopen しない**。`--branch reuse` は未 merge の同じ branch・PR を使う前提で、merge 済みかを plan.sh は調べない（Director が `gh pr view` で確かめてから打つ。`--branch reuse` は必須）。merge 済みなら新 task を足す。
 - **総試行数の上限**: `execution_count` が `attempts.max_total`（`config/crewvia.yaml`。既定 6。card の `max_attempts` が優先）に達していると `retry` / `reopen` は `ATTEMPT_CAP`（下流を戻すときは戻される各 task にも効く）。本当に続けたいときだけ `--over-cap "<理由>"`（理由は台帳に残る）。Codex の巡が 6 を超えそうなら、先に指摘の系統を塞ぐ（巡を重ねる前に設計を見直す）か、`--over-cap` を理由つきで使う。
 - 途中で止まった reopen は同じコマンドの再実行で完了する（未完の間は `update` / `add` / `retry` / `release-dep` が `REOPEN_INTENT_GRAPH_FROZEN` で拒否される）。
+
+**モデルの段上げ（`--cause`・設計 `knowledge/model-escalation.md` §4.1）**: `reopen` は差し戻しの**種類**を必ず選ぶ（無い・他の値は exit 3・何も書かない）。
+- `--cause quality` — 設計の誤り・レビューで「考えが足りない」と指摘された・要件の取り違え。実装 task のモデルを **1 段上げる**（haiku → sonnet → opus。起点は閉じた試行の実際のモデル）。上がった task は束ねた Worker（dispatcher の `no_worker` 通知の起動コマンド。`CREWVIA_BIND_TASK` 付き）だけが取る。
+- `--cause mechanical` — CI の赤・構造ガード・テストの書き方（fixture・表の行の足し忘れ等）・Codex の細かい境界値や入力検査の追加など**機械的な直し**。上げない。
+- 理由: 実装の既定は sonnet なので、機械的な差し戻しまで上げると 1 回で opus になり、opus での 2 回目の通知（`[model-at-cap]`）が日常的に出る（11-24 の実績では reopen の約半分が機械的）。迷ったら「同じモデルがもう一度読めば直せるか」で決める（直せる = mechanical）。
+- 例外の上書き: `--escalate-model` / `--no-escalate`。`--cause mechanical --escalate-model`・`--cause quality --no-escalate` のような食い違いは使い方の誤り（exit 3）。review / qa / codex-review の task は常に上げない（`MODEL_ESCALATION_NOT_APPLICABLE`）。cascade で戻る下流も上げない。
+- `verify-result fail` は検証者が出来を断った = 品質の差し戻しなので**既定で上げる**（`--no-escalate` で止める）。`retry` は既定で上げない（Worker の停止・環境の失敗が大半）。品質由来の `failed` を再挑戦させるときだけ `--escalate-model`。
+- opus のまま 2 回差し戻された task は dispatcher が `[model-at-cap]` で 1 回通知する（3 回目以降は送らない）。task の分割・設計の見直しの合図。`update --model-override none` で数え直し。
+- config が**無い**・モデルの値の型が違う（`worker_model: 123` 等）ために既定モデルが分からないときは差し戻しだけ進み、段上げは飛ぶ（stderr の `MODEL_ESCALATION_SKIPPED:config_unreadable`）。**config が YAML として壊れているときは reopen / retry が段上げより前に exit 1・何も書かずに断る**（既存の `attempts.max_total` の読み込み。`config/crewvia.local.yaml` を直すか一時的に退避する）。verify-result fail は進む。
 
 **新 task を足すほうがよい場面**: 修正が**別の PR** になる（merge 済みの PR への追従を含む）／元の task と範囲が違う（別の deliverable・別の skills・別のファイル群）／元の task の Result を書き換えたくない（監査上、完了した作業の記録を残したい）／上限に達していて続ける理由が無い。
 

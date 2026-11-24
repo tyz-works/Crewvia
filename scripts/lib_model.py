@@ -25,6 +25,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import lib_config  # noqa: E402
+import lib_dep_rules as _dep  # noqa: E402
 from lib_task_cards import (  # noqa: E402
     is_unreadable, read_regular_text_or_unreadable,
 )
@@ -237,6 +238,122 @@ def effective_model(config_path: str, skills, override=None) -> str:
         return override
     csv = ",".join(skills) if isinstance(skills, (list, tuple, set)) else (skills or "")
     return resolve(config_path, csv)
+
+
+# ---------------------------------------------------------------------------
+# 自動の段上げの判定 (PR-3。設計 knowledge/model-escalation.md §4.1・§4.6・§4.8)
+# ---------------------------------------------------------------------------
+#: 台帳の `model_escalation` の値 (固定の語彙。文面は読まない)
+ESC_ESCALATED = 'escalated'                  # 1 段上げた (sonnet → opus 等)
+ESC_AT_CAP = 'at_cap'                        # 起点がもう opus (上限のまま。`model_at_cap_count` を数える)
+ESC_DECLINED = 'declined'                    # 上げない指定 (mechanical / --no-escalate / フラグ無しの retry)
+ESC_NOT_APPLICABLE = 'not_applicable'        # review / qa / codex-review の task (`escalation_applicable` が偽)
+ESC_SKIPPED_CONFIG = 'skipped:config_unreadable'   # 既定モデルが決められない (差し戻しは進める)
+ESC_SKIPPED_NO_BASE = 'skipped:no_base'      # 起点の段が分からない
+
+#: reopen の差し戻しの種類 (`plan.sh reopen --cause`)。quality = 設計の誤り・考え不足・要件の取り違え (1 段上げる)、
+#: mechanical = CI の赤・構造ガード・テストの書き方・細かい境界値や入力検査 (上げない)
+CAUSES = ('quality', 'mechanical')
+
+
+def escalation_applicable(skills) -> bool:
+    """段上げしてよい task か (§4.1)。skills が `CASCADE_REVIEW_SKILLS` (review / qa / codex-review) と交わらない実装 task だけ。
+    reopen・verify-result fail・retry の 3 つの入口が全部これを通す (新しい集合を作らない)。"""
+    if isinstance(skills, str):
+        skills = [x.strip() for x in skills.split(',') if x.strip()]
+    return not any(x in _dep.CASCADE_REVIEW_SKILLS for x in (skills or []))
+
+
+def default_model(config_path: str, skills):
+    """`(既定モデル, 問題)`。config が読めなければ `(None, 'config_unreadable')` (`resolve` と違い、空と壊れを区別する)。
+    読めて何も決まらなければ `('', None)`。"""
+    csv = ",".join(skills) if isinstance(skills, (list, tuple, set)) else (skills or "")
+    p = Path(config_path)
+    if not p.exists():
+        return None, 'config_unreadable'
+    try:
+        if yaml is not None:
+            config = lib_config.load_for_path(str(p))
+            if is_unreadable(config):
+                return None, 'config_unreadable'
+        else:
+            config = _parse_yaml_fallback(str(p))
+    except Exception:  # noqa: BLE001
+        return None, 'config_unreadable'
+    wanted = [s.strip() for s in csv.split(",") if s.strip()]
+    try:
+        if not isinstance(config, dict):
+            return None, 'config_unreadable'
+        worker_model = config.get("worker_model", "") or ""
+        per_skill = config.get("model_per_skill", {}) or {}
+        # 値の型が違う (worker_model: 123・model_per_skill: 123 / list・skill の値が数値など) = 読めない扱い。例外にしない。
+        if not isinstance(worker_model, str) or not isinstance(per_skill, dict):
+            return None, 'config_unreadable'
+        if not wanted:
+            return worker_model, None
+        best, best_rank = "", -1
+        for skill in sorted(wanted):
+            cand = (per_skill[skill] or "") if skill in per_skill else worker_model
+            if not isinstance(cand, str):
+                return None, 'config_unreadable'
+            if cand and _model_rank(cand) > best_rank:
+                best, best_rank = cand, _model_rank(cand)
+        return best, None
+    except Exception:  # noqa: BLE001
+        return None, 'config_unreadable'
+
+
+def want_escalation(command, *, cause=None, escalate_model=False, no_escalate=False) -> bool:
+    """この差し戻しが段上げを**求めているか** (§4.1 の表。適用できるかは `decide_escalation` が `escalation_applicable` で見る)。
+    reopen は `cause` (quality = 上げる / mechanical = 上げない)、verify-result fail は既定で上げる、retry は `--escalate-model` のときだけ。
+    `--no-escalate` は常に勝つ (食い違い (mechanical + --escalate-model / quality + --no-escalate) は plan.sh が先に断る)。"""
+    if no_escalate:
+        return False
+    if escalate_model:
+        return True
+    if command == 'reopen':
+        return cause == 'quality'
+    if command == 'verify_fail':
+        return True
+    return False
+
+
+def decide_escalation(wants, *, skills, closed_model, current_override, config_path, closed_execution_id,
+                      at_cap_count=0, at_cap_execution=None):
+    """段上げの決定。`dict(code, escalate_to, model_from, at_cap_count, at_cap_execution, applied)`。
+    `escalate_to` / `model_from` は別名か None。`at_cap_*` は card に書く新しい値 (変えないなら今の値)。
+
+    起点は 閉じた試行の `execution_model` → 今の `model_override` → 既定モデル の順の、最初の**段の分かるもの** (§4.2)。
+    既定モデルは前の 2 つが段を持たないときだけ読む。config が読めなければ `skipped:config_unreadable` (差し戻しは進める。§4.8)。
+    起点が opus なら上がらず `at_cap` (`model_override` は opus のまま)。数は **at_cap のときだけ** +1 し、ちょうど 2 になった
+    差し戻しの試行 ID だけを `at_cap_execution` にする (3 回目以降は書き換えない。§4.6)。"""
+    out = dict(code=ESC_DECLINED, escalate_to=None, model_from=None, at_cap_count=at_cap_count,
+               at_cap_execution=at_cap_execution, applied=False)
+    if not wants:
+        return out
+    if not escalation_applicable(skills):
+        out['code'] = ESC_NOT_APPLICABLE
+        return out
+    base = escalation_base(closed_model, current_override)
+    if base is None:
+        dflt, problem = default_model(config_path, skills)
+        if problem:
+            out['code'] = ESC_SKIPPED_CONFIG
+            return out
+        base = escalation_base(dflt)
+        if base is None:
+            out['code'] = ESC_SKIPPED_NO_BASE
+            return out
+    target = escalate(base, current_override)
+    out.update(escalate_to=target, model_from=alias_of(base), applied=True)
+    if alias_of(base) == ESCALATION_LADDER[-1]:
+        count = at_cap_count + 1
+        out.update(code=ESC_AT_CAP, at_cap_count=count)
+        if count == 2:
+            out['at_cap_execution'] = closed_execution_id
+    else:
+        out['code'] = ESC_ESCALATED
+    return out
 
 
 # ---------------------------------------------------------------------------

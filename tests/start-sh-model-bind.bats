@@ -203,6 +203,16 @@ _mission() {   # _mission <override|-> : 使い捨ての queue に mission と t
     rm -f "${REPO_ROOT}/registry/workers/Ren"
 }
 
+@test "an unbound start whose model.json cannot be written also refuses (a predecessor's record must not outlive it)" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE CREWVIA_BIND_TASK
+    mkdir -p "${REPO_ROOT}/registry/workers"
+    printf 'x' > "${REPO_ROOT}/registry/workers/Ren"
+    run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"起動しません"* ]]
+    rm -f "${REPO_ROOT}/registry/workers/Ren"
+}
+
 @test "CREWVIA_BIND_TASK is for workers only" {
     _mission opus
     CREWVIA_BIND_TASK=m-bind/t001 run bash "$START_SH" director --name Sora

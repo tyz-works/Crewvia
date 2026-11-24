@@ -7575,6 +7575,10 @@ def cmd_update(args):
                     meta.pop(k, None)
                 changed.append('model_override=none')
             else:
+                if 'codex-review' in set(meta.get('skills') or []):
+                    # codex-review は kai-review.sh が走らせ、束ねも override も使わない (設計: codex-review には欄を書かない)。
+                    # 書くと pull がモデル判定で止まる。none (消す) は上の分岐で通る
+                    _usage_exit(f"{task_id} は skills に codex-review を含むので --model-override は付けられません。何も書いていません")
                 meta['model_override'] = model_override_update
                 changed.append(f"model_override={model_override_update}")
 

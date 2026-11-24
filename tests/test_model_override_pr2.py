@@ -469,6 +469,34 @@ def test_update_model_override_refuses_a_non_alias_and_writes_nothing(box, bad):
     assert box.snapshot() == before
 
 
+def test_update_model_override_refuses_a_codex_review_card_and_writes_nothing(box):
+    assert _update(box, "--skills", "codex-review").returncode == 0
+    before = box.snapshot()
+    r = _update(box, "--model-override", "opus")
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert "codex-review" in r.stderr
+    assert box.snapshot() == before
+    assert _update(box, "--model-override", "none").returncode == 0     # 消す口は残す
+
+
+def test_dispatcher_holds_a_codex_review_card_that_has_an_override(tmp_path):
+    root = base._build_repo(tmp_path)
+    p = root / "queue" / "missions" / SLUG / "tasks" / "t001.md"
+    t = p.read_text()
+    assert "- code" in t or "skills" in t
+    t = re.sub(r"(skills:\s*\[)[^\]]*(\])", r"\1codex-review\2", t, count=1) if "skills: [" in t \
+        else re.sub(r"(skills:\n)(\s*- .*\n)+", r"\1  - codex-review\n", t, count=1)
+    p.write_text(t)
+    _set_override(root, "opus")
+    spawned = []
+    mux = base.FakeMux([base.WINDOW])
+    ns = base._load_dispatcher(root, mux)
+    ns["handle_codex_review"] = lambda *a, **k: spawned.append(a)
+    ns["dispatch"]()
+    assert not spawned
+    assert not _assigned(mux)
+
+
 def test_update_model_override_also_clears_the_at_cap_fields(box):
     assert _update(box, "--model-override", "opus").returncode == 0
     # PR-3 が書く欄 (書き手は無い) を手で置き、none で一緒に消えること

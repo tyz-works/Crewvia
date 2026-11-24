@@ -736,18 +736,15 @@ fi
 # 同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。mux は「既に居る」(10/11) で終わった呼び出しが
 # 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
 _record_worker_model() {
-  # 束ねた起動 (BIND_TASK あり) は記録が割り当ての根拠 (bound_task) なので、書けなければ**失敗を返す**
-  # (呼び側が起動した Worker を止める = fail-closed)。束ねの無い起動は警告だけで続行 (従来どおり)。
+  # 記録は割り当ての根拠 (bound_task / source) なので、書けなければ**常に失敗を返す** (呼び側が起動した Worker を止める = fail-closed)。
+  # 束ねの有無で分けない: 書けないまま続行すると、同名の前任の読める記録 (source=env・古い bound_task) が
+  # 新しい Worker の許可として残る (PR-2 Codex 2 巡目 P2)。
   if python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" "$BIND_TASK" >/dev/null; then
     return 0
   fi
-  if [[ -n "$BIND_TASK" ]]; then
-    echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録 (bound_task=${BIND_TASK}) を書けませんでした — 束ねた起動は記録が無いと他の task を取りうるので起動しません" >&2
-    return 1
-  fi
-  echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
-  return 0
+  echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録を書けませんでした (bound_task=${BIND_TASK:-なし}) — 前任の記録が残ると他の task を取りうるので起動しません" >&2
+  return 1
 }
 
 MODEL_FLAG=()
@@ -1054,7 +1051,7 @@ PYEOF
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
     if ! _record_worker_model; then
-      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の束ねた起動を止めました (${BIND_TASK})"
+      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
       mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
         || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
       exit 1
@@ -1212,7 +1209,7 @@ else
     exit 1
   }
   if [[ "${ROLE}" == "worker" ]]; then
-    _record_worker_model || { _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の束ねた起動を止めました (${BIND_TASK})"; exit 1; }
+    _record_worker_model || { _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"; exit 1; }
   fi
   # herdr server 汚染の伝播を防ぐため exec 直前に除去する (mux 経由と同様の防御)。
   unset CLAUDE_CODE_CHILD_SESSION

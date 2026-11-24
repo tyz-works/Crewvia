@@ -3196,6 +3196,19 @@ def dispatch():
         # live run — an orphan assignment does not count)
         # or when pr_number is missing (warning logged, Director escalates).
         if task_skills & CODEX_REVIEW_SKILLS:
+            # codex-review に model_override が付いている card (手書き・skills の後からの変更) は spawn せず保留 (設計: codex-review には欄を書かない)。
+            # Director に 1 回だけ (状態ベース。消せば台帳から捨てられる)。
+            if meta.get('model_override') is not None:
+                _ckey = f'model-override-codex-review-{slug}-{task_id}'
+                live_state_keys.add(_ckey)
+                def _cmsg(_t=task_id, _s=slug):
+                    return (f"[model-override-codex-review] task {_t} (mission={_s}): codex-review の card に model_override が付いているため "
+                            f"保留しています (codex-review は束ねも override も使わない)。"
+                            f"消す: plan.sh update {_t} --model-override none --mission {_s}")
+                notify_state_once(_ckey, fingerprint('model_override_codex_review', repr(meta.get('model_override'))),
+                                  'model-override-codex-review', slug, task_id, _cmsg,
+                                  director_live=director_live_for_state_notices)
+                continue
             handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission)
             continue
         # 段上げの印 (model_override) が壊れた task は割り当てない (§4.8)。既定モデルに黙って倒すと、上げたはずの task が

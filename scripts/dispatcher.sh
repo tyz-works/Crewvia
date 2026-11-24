@@ -1007,11 +1007,19 @@ def worker_may_take_task(agent_name, meta, slug=None):
     3 か所がここを通る (plan.sh pull は同じ 2 つの lib を同じ順で使う)。`slug` が無ければ meta の mission を指せないので
     モデルの判定は束ねの照合に使えない (呼び出し側は必ず渡す)。
     """
+    ok, why, _kind = worker_take_verdict(agent_name, meta, slug)
+    return ok, why
+
+
+def worker_take_verdict(agent_name, meta, slug=None):
+    """`worker_may_take_task` の本体: `(可否, 理由, 断った原因)`。原因は `'target'` / `'model'` / `None` (取れる)。
+    ログの文面とキーを原因で分けるため (呼び出し側は理由の文字列を解析しない)。2 つの判定を呼ぶのはここだけ。"""
     ok, why = _worker_target.worker_may_take(
         worker_target_record(agent_name), meta.get('target_dir'))
     if not ok:
-        return ok, why
-    return _worker_model.worker_may_take(worker_model_record(agent_name), meta, slug)
+        return ok, why, 'target'
+    ok, why = _worker_model.worker_may_take(worker_model_record(agent_name), meta, slug)
+    return ok, why, (None if ok else 'model')
 
 
 def worker_outstanding_assignment(agent_name, all_tasks):
@@ -3002,11 +3010,12 @@ def dispatch():
                 # task は回さない (別 repo 用の Worker に crewvia 本体の task が回り、
                 # 差し戻しても同じ Worker に再割り当てされた)。記録が読めない Worker には
                 # target_dir 付きの task を回さない (保留)。判定は lib_worker_target 1 つ。
-                may_take, why_not = worker_may_take_task(agent_name, meta, slug)
+                may_take, why_not, _refused_by = worker_take_verdict(agent_name, meta, slug)
                 if not may_take:
-                    _tkey = f"target_skip_{agent_name}_{slug}_{meta['id']}"
+                    # 断った原因で表示とキーを分ける (TARGET_DIR は target_skip_・モデルの束ねは model_skip_)
+                    _tkey = f"{_refused_by}_skip_{agent_name}_{slug}_{meta['id']}"
                     if should_notify(_tkey):
-                        log(f"[target] {agent_name}: task {meta['id']} (mission={slug}) を割り当てない — {why_not}")
+                        log(f"[{_refused_by}] {agent_name}: task {meta['id']} (mission={slug}) を割り当てない — {why_not}")
                         record_notify(_tkey)
                     continue
                 best = (slug, meta)

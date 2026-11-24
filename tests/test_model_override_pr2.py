@@ -171,10 +171,10 @@ def _calls(src, attr):
 
 def test_dispatcher_and_pull_call_the_one_shared_function():
     dsrc = re.search(r"<<'PYEOF'\n(.*)\nPYEOF", (SCRIPTS / "dispatcher.sh").read_text(), re.S).group(1)
-    assert len(_calls(dsrc, "worker_may_take")) == 2          # target + model の AND (1 関数 worker_may_take_task の中)
+    assert len(_calls(dsrc, "worker_may_take")) == 2          # target + model の AND (1 関数 worker_take_verdict の中)
     assert any(c.func.value.id == "_worker_model" for c in _calls(dsrc, "worker_may_take"))
     psrc = (SCRIPTS / "plan.sh").read_text()
-    assert psrc.count("_WORKER_MODEL.worker_may_take_for(") == 2     # --task の照合 + 自動の絞り込み
+    assert psrc.count("_WORKER_MODEL.worker_may_take_for(") == 3     # --task の照合 + 自動の絞り込み + 予約の再開
     # 判定の表をコピーしない: plan.sh / dispatcher.sh に bound_task の比較が無い
     assert "bound_task" not in psrc
     assert "'bound_task'" not in dsrc
@@ -182,7 +182,7 @@ def test_dispatcher_and_pull_call_the_one_shared_function():
 
 def test_dispatcher_takes_target_before_model():
     dsrc = re.search(r"<<'PYEOF'\n(.*)\nPYEOF", (SCRIPTS / "dispatcher.sh").read_text(), re.S).group(1)
-    fn = next(n for n in ast.walk(ast.parse(dsrc)) if isinstance(n, ast.FunctionDef) and n.name == "worker_may_take_task")
+    fn = next(n for n in ast.walk(ast.parse(dsrc)) if isinstance(n, ast.FunctionDef) and n.name == "worker_take_verdict")
     order = [c.func.value.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
              and c.func.attr == "worker_may_take"]
     assert order == ["_worker_target", "_worker_model"]
@@ -278,10 +278,18 @@ def test_no_worker_message_carries_bind_command_model_and_exclude(tmp_path):
     assert "モデル" in m            # 担当できない理由 (model) も出る
 
 
+def _put_roster(root, entries):
+    """registry の名簿を lib_registry の書き込み口で作る (生の write_text は構造ガードが検出する)。"""
+    import lib_registry
+    by_name = {n: {"name": n, "skills": sk, "task_count": 0, "last_active": "", **({"role": r} if r else {})}
+               for n, sk, r in entries}
+    lib_registry.write(str(root / "registry" / "workers.yaml"), "", [n for n, _s, _r in entries], by_name)
+
+
 def test_no_worker_message_for_a_plain_task_has_no_bind(tmp_path):
     root = base._build_repo(tmp_path)
     # 担当できる Worker がいない (skill 違い) 平文の task
-    (root / "registry" / "workers.yaml").write_text("workers:\n  - name: Other\n    skills: [docs]\n    experience: 0\n")
+    _put_roster(root, [("Other", ["docs"], None)])
     mux = base.FakeMux([])
     base._load_dispatcher(root, mux)["dispatch"]()
     msgs = [m for _t, m in mux.sent if "起動コマンド" in m]
@@ -410,9 +418,7 @@ def test_broken_override_is_not_assigned_and_the_director_is_told_once(tmp_path)
     _set_override(root, "opus-4")
     _put_model_record(root, source="env", model="opus")
     # Director が生きている構成
-    (root / "registry" / "workers.yaml").write_text(
-        f"workers:\n  - name: {AGENT}\n    skills: [code]\n    experience: 0\n"
-        f"  - name: Dirk\n    role: director\n    skills: []\n    experience: 0\n")
+    _put_roster(root, [(AGENT, ["code"], None), ("Dirk", [], "director")])
     mux = base.FakeMux([base.WINDOW, "Dirk-director"])
     ns = base._load_dispatcher(root, mux)
     ns["dispatch"]()
@@ -498,6 +504,19 @@ def test_model_for_with_a_broken_override_does_not_fall_back_to_the_default(box)
     p.write_text(p.read_text().replace("target_dir: null\n", "target_dir: null\nmodel_override: opus-4\n", 1))
     r = box.plan("model-for", "t001", "--mission", MISSION)
     assert r.returncode == 1 and r.stdout == ""
+
+
+def test_model_for_source_says_override_only_when_the_card_has_one(box):
+    r = box.plan("model-for", "t001", "--mission", MISSION, "--source")
+    assert (r.returncode, r.stdout.split()) == (0, ["haiku", "skill"]), r.stderr
+    assert _update(box, "--model-override", "opus").returncode == 0
+    r = box.plan("model-for", "t001", "--mission", MISSION, "--source")
+    assert (r.returncode, r.stdout.split()) == (0, ["opus", "override"])
+
+
+def test_dispatcher_logs_a_model_refusal_under_its_own_key():
+    src = (SCRIPTS / "dispatcher.sh").read_text()
+    assert "_skip_{agent_name}_{slug}" in src and "worker_take_verdict" in src
 
 
 def test_model_for_writes_nothing(box):
@@ -590,3 +609,35 @@ def test_lint_flags_a_broken_override_and_at_cap_count():
     assert fails({"model_at_cap_count": -1})
     assert fails({"model_at_cap_count": True})
     assert not fails({"model_at_cap_count": 2})
+
+
+# --- 予約の再開も同じモデルの判定を通る (Codex P2) ----------------------------------
+
+def _seed_reserved(box):
+    """Ren が t001 を予約しただけ (start 前) の形にする。"""
+    import lib_state_store as store
+    assert box.pull("Ren").returncode == 0
+    with store.transaction(box.queue, op="seed", actor="test") as txn:
+        meta, body = txn.load_card(MISSION, "t001")
+        meta.update(execution_status="reserved")
+        txn.write_card(MISSION, "t001", meta, body)
+
+
+@pytest.mark.parametrize("auto", [True, False], ids=["auto-resumable", "explicit-in_progress"])
+def test_resume_of_a_reservation_is_refused_when_the_model_rule_no_longer_allows_it(box, auto):
+    _bind(box, "Ren", None, "sonnet", "skill")
+    _seed_reserved(box)
+    assert _update(box, "--model-override", "opus").returncode == 0     # 予約の後に段上げされた
+    before = box.snapshot()
+    p = box.pull("Ren", auto=True) if auto else box.pull("Ren")
+    assert p.returncode == 3 and p.stdout.strip() == "", (p.returncode, p.stderr)
+    assert "再開" in p.stderr
+    assert box.snapshot() == before
+
+
+@pytest.mark.parametrize("auto", [True, False], ids=["auto-resumable", "explicit-in_progress"])
+def test_resume_of_a_reservation_still_works_for_a_plain_task(box, auto):
+    _bind(box, "Ren", None, "sonnet", "skill")
+    _seed_reserved(box)
+    p = box.pull("Ren", auto=True) if auto else box.pull("Ren")
+    assert p.returncode == 0, p.stderr

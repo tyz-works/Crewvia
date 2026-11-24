@@ -144,6 +144,16 @@ _mission() {   # _mission <override|-> : 使い捨ての queue に mission と t
     [ "$output" = "$EXPECT" ]
 }
 
+@test "a bound start for a card without model_override records source skill, not override" {
+    _mission -
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE
+    CREWVIA_BIND_TASK=m-bind/t001 run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    run _record Ren
+    [[ "$output" == *'"source": "skill"'* ]]
+    [[ "$output" == *'"bound_task": "m-bind/t001"'* ]]
+}
+
 @test "an explicit env wins over the card, and a lower one warns" {
     _mission opus
     unset CREWVIA_QUEUE
@@ -179,6 +189,18 @@ _mission() {   # _mission <override|-> : 使い捨ての queue に mission と t
     grep -q 'kind=bind-task' "${REPO_ROOT}/logs/start-sh/refusals.log"
     CREWVIA_PRINT_MODEL=1 CREWVIA_BIND_TASK=m-bind/t999 run bash "$START_SH" worker --name Ren code python
     [ "$status" -eq 1 ]
+}
+
+@test "a bound start whose model.json cannot be written refuses to start (fail-closed)" {
+    unset CREWVIA_WORKER_MODEL CREWVIA_QUEUE
+    _mission opus
+    mkdir -p "${REPO_ROOT}/registry/workers"
+    printf 'x' > "${REPO_ROOT}/registry/workers/Ren"      # Ren/ を作れない = model.json を書けない
+    CREWVIA_BIND_TASK=m-bind/t001 run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"起動しません"* ]]
+    grep -q 'kind=bind-task-record' "${REPO_ROOT}/logs/start-sh/refusals.log"
+    rm -f "${REPO_ROOT}/registry/workers/Ren"
 }
 
 @test "CREWVIA_BIND_TASK is for workers only" {

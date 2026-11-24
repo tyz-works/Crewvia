@@ -123,6 +123,7 @@ BIND_TASK=""
 BIND_MODEL=""
 BIND_ERR=""
 BIND_PULL_FLAGS=""
+BIND_SOURCE="skill"
 if [[ -n "${CREWVIA_BIND_TASK:-}" ]]; then
   BIND_TASK="${CREWVIA_BIND_TASK}"
   if [[ "${ROLE}" != "worker" ]]; then
@@ -132,7 +133,10 @@ if [[ -n "${CREWVIA_BIND_TASK:-}" ]]; then
   else
     _BIND_SLUG="${BIND_TASK%%/*}"
     _BIND_TID="${BIND_TASK#*/}"
-    if BIND_MODEL="$(bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" 2>/dev/null)" && [[ -n "$BIND_MODEL" ]]; then
+    if _BIND_OUT="$(bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" --source 2>/dev/null)" \
+        && BIND_MODEL="$(printf '%s\n' "$_BIND_OUT" | sed -n 1p)" && [[ -n "$BIND_MODEL" ]]; then
+      BIND_SOURCE="$(printf '%s\n' "$_BIND_OUT" | sed -n 2p)"
+      [[ "$BIND_SOURCE" == "override" ]] || BIND_SOURCE="skill"      # card に model_override が無い束ね = skills の既定 (override と書かない)
       BIND_PULL_FLAGS="--task ${_BIND_TID} --mission ${_BIND_SLUG} "
     else
       BIND_MODEL=""
@@ -720,7 +724,7 @@ fi
 if [[ "${ROLE}" == "worker" && "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
   SELECTED_MODEL_SOURCE="env"
 elif [[ -n "$BIND_MODEL" ]]; then
-  SELECTED_MODEL_SOURCE="override"
+  SELECTED_MODEL_SOURCE="$BIND_SOURCE"
 elif [[ -n "$SELECTED_MODEL" ]]; then
   SELECTED_MODEL_SOURCE="skill"
 else
@@ -732,9 +736,18 @@ fi
 # 同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。mux は「既に居る」(10/11) で終わった呼び出しが
 # 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
 _record_worker_model() {
-  python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
-    "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" "$BIND_TASK" >/dev/null \
-    || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
+  # 束ねた起動 (BIND_TASK あり) は記録が割り当ての根拠 (bound_task) なので、書けなければ**失敗を返す**
+  # (呼び側が起動した Worker を止める = fail-closed)。束ねの無い起動は警告だけで続行 (従来どおり)。
+  if python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+      "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" "$BIND_TASK" >/dev/null; then
+    return 0
+  fi
+  if [[ -n "$BIND_TASK" ]]; then
+    echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録 (bound_task=${BIND_TASK}) を書けませんでした — 束ねた起動は記録が無いと他の task を取りうるので起動しません" >&2
+    return 1
+  fi
+  echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
+  return 0
 }
 
 MODEL_FLAG=()
@@ -1040,7 +1053,12 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
-    _record_worker_model
+    if ! _record_worker_model; then
+      _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の束ねた起動を止めました (${BIND_TASK})"
+      mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
+        || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
+      exit 1
+    fi
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
@@ -1193,7 +1211,9 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
-  [[ "${ROLE}" == "worker" ]] && _record_worker_model
+  if [[ "${ROLE}" == "worker" ]]; then
+    _record_worker_model || { _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の束ねた起動を止めました (${BIND_TASK})"; exit 1; }
+  fi
   # herdr server 汚染の伝播を防ぐため exec 直前に除去する (mux 経由と同様の防御)。
   unset CLAUDE_CODE_CHILD_SESSION
   # 二重防御: unset が漏れても transcript 保存を公式 env var で保証する (→ t004)。

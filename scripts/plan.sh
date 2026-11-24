@@ -3531,7 +3531,7 @@ def cmd_model_for(args):
     **決められなければ exit 1・stdout 空** (既定に倒さない): mission / task の識別子が使えない・card が無い・読めない・
     `model_override` が別名でない・既定モデルが空 (CLI の既定) / config が読めない。識別子は `pr-base` と同じく
     パスにする前に `check_mission_slug` / `check_task_id` で検査する。"""
-    opts, positional = parse_opts(args, {'--mission': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--source': 'bool'})
     if '--mission' not in opts:
         die("model-for: --mission <slug> が必要です", 1)
     slug, task_id = opts['--mission'], positional[0]
@@ -3554,7 +3554,10 @@ def cmd_model_for(args):
     model = _MODEL.effective_model(os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'), meta.get('skills') or [], override)
     if not model:
         die(f"model-for: {slug}/{task_id} の実効モデルを決められません (既定モデルが空)")
+    # --source: 2 行目に出どころ (model.json の source と同じ語彙): card に model_override があれば override・無ければ skill。
     print(model)
+    if opts.get('--source'):
+        print('override' if override else 'skill')
 
 
 def cmd_resolve_pr(args):
@@ -4476,6 +4479,16 @@ def cmd_pull(args):
 
         if resumable is not None:
             slug, meta, body = resumable
+            # 再開も新規の割り当てと同じモデルの判定を通す (自動の resumable と明示の in_progress の 2 経路がここに合流する)。
+            # 予約の後で model.json / model_override が変わった (別モデルで起動し直した・段上げされた) Worker が、
+            # 今の規則では取れない task を再開しない。dispatcher と同じ lib_worker_model.worker_may_take (コピーしない)。
+            _resume_ok, _resume_why = _WORKER_MODEL.worker_may_take_for(registry_dir(), agent, meta, slug)
+            if not _resume_ok:
+                die(
+                    f"task '{meta.get('id')}' の予約は、この Worker には再開させません: {_resume_why}。"
+                    f"再開しません (何も書いていません)。Director が `update --reset` で開き直してください。",
+                    PRECONDITION_UNMET,
+                )
             _resume_reserved(slug, meta, body, agent, slugs)
             started_holder[0] = meta.get('started_at')
             execution_holder[0] = {

@@ -521,12 +521,15 @@ TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at',
     *_ex.EXECUTION_FIELDS,                     # 01c: 試行の欄は `started_at` の直後 (execution.md §1.2)
+    'execution_model',                         # 段上げ PR-1: 今の試行を走らせた Worker のモデル (EXECUTION_FIELDS には入れない。§4.4)
     'completed_at',
     'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'pr_repo', 'no_pr_waiver', 'deliverable',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
     'result_execution_id',                     # vNext 02 PR-D: card の Result 節を最後に置き換えた試行 (台帳の帰属。§3.2)
     'max_attempts',                            # vNext 02 PR-E: この task だけ総試行数の上限を上書きする (任意。§3.7)
+    'model_override',                          # 段上げ PR-2: 段上げで決めたモデルの別名 (haiku / sonnet / opus。§4.4)
+    'model_at_cap_count', 'model_at_cap_execution',   # 段上げ PR-3 が書く (opus のまま差し戻された回数と、2 回目の試行の ID。§4.6)
 ]
 
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id',

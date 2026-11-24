@@ -945,6 +945,8 @@ ALLOWED_SUBPROCESS_CALLS = {
     # -- lib_mux.py: mux の制御コマンド -------------------------------------
     # どれも tmux / herdr にペインを操作させるもので、ファイルを読ませていない。
     ("lib_mux.py", "spawn", "tmux"): "ペインを作る",
+    ("lib_mux.py", "_cli_main", "bash"): ("spawn の --pre-launch-cmd (start.sh が渡す model.json の記録コマンド) を bash -c で走らせる。"
+                                          "読むのではなく書く側 (lib_worker_model.py record) で、queue は読まない・書かない"),
     ("lib_mux.py", "kill", "tmux"): "ペインを畳む",
     ("lib_mux.py", "list", "tmux"): "ペイン一覧",
     ("lib_mux.py", "capture", "tmux"): "ペインの画面を取る",

@@ -178,7 +178,8 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('review-plan.sh', '<bash>'): (6, "plan_review.md / plan_review.verdict の tmp+mv と reviewer ログ。書き手 1 者で run_id で鮮度を"
                                      "確かめる読み手がいる (§5.1 の「寄せない」)"),
     ('start.sh', '<bash>'): (7, "Worker の settings / prompt の一時ファイルと refusals.log (registry/start-sh)。queue の状態を書かない。"
-                                "起動時の 1 者"),
+                                 "起動時の 1 者。モデルの段上げ PR-2: spawn が失敗しても model.json は消さない (attempt 8)・退避・復元 (mktemp / cp) も印の一時ファイルも持たない。"
+                                 "書き込みの本体 (model.json の作成) は lib_worker_model.py record を通る"),
     ('start.sh', '<module>'): (4, "Worker の `.claude/settings` (target_dir 側) を書く。queue / registry の外"),
     ('migrate-local-config.sh', '<bash>'): (9, "config/ の移行スクリプト (手動で 1 回走らせる)。書き先は config/crewvia.local.yaml・共通 config の復元・"
                                                "退避先 ~/crewvia-local-migrate-<時刻>/ (手元版・差分・dump) と stdout/stderr の捨て先だけで、"

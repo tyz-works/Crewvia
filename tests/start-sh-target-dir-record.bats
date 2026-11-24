@@ -168,14 +168,27 @@ _record() {
     [ ! -e "${REPO_ROOT}/registry/workers/Sora" ]
 }
 
-@test "a record that cannot be written does not stop the launch" {
-    # registry/workers をファイルにして、ディレクトリを作れなくする (複製の中だけ。
-    # 複製元の木にディレクトリが残っていても始められるよう、先に片付ける)。
+@test "a registry that cannot be written stops the launch (model.json is fail-closed) and is logged" {
+    # registry/workers をファイルにして、ディレクトリを作れなくする (複製の中だけ)。
+    # model.json を書けない Worker は起動しない (PR-2: 前任の記録が許可として残らないように)。
     find "${REPO_ROOT}/registry/workers" -depth -delete 2>/dev/null || true
     : > "${REPO_ROOT}/registry/workers"
+    run bash "$START_SH" worker --name Ren code python
+
+    [ "$status" -ne 0 ]
+    # model.json は spawn の前に書く (設計 §4.2) ので、書けなければ spawn も TARGET_DIR の記録も行わずに止まる
+    [[ "$output" == *"モデルの記録を書けませんでした"* ]]
+    [[ "$output" != *"Agent launched"* ]]
+    grep -q 'kind=bind-task-record' "${REPO_ROOT}/logs/start-sh/refusals.log"
+}
+
+@test "only the TARGET_DIR record failing still launches (model.json is written)" {
+    # target_dir.json の場所をディレクトリにして TARGET_DIR の記録だけ失敗させる。
+    mkdir -p "${REPO_ROOT}/registry/workers/Ren/target_dir.json"
     run bash "$START_SH" worker --name Ren code python
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Agent launched in mux window"* ]]
     [[ "$output" == *"TARGET_DIR を記録できませんでした"* ]]
+    [ -f "${REPO_ROOT}/registry/workers/Ren/model.json" ]
 }

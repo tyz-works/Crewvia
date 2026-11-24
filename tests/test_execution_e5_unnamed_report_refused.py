@@ -190,7 +190,7 @@ def test_dispatcher_assignment_message_tells_the_worker_to_name_the_attempt():
 
 def test_start_sh_kickoff_messages_tell_the_worker_to_name_the_attempt():
     lines = [ln for ln in (REPO_ROOT / "scripts" / "start.sh").read_text(encoding="utf-8").splitlines()
-             if ln.lstrip().startswith("KICKOFF_MSG=") and "plan pull --agent" in ln]
+             if ln.lstrip().startswith("KICKOFF_MSG=") and "plan pull ${BIND_PULL_FLAGS}--agent" in ln]
     assert len(lines) == 2, lines                                         # target_dir 版と通常版
     for ln in lines:
         assert "--execution" in ln and "execution_id" in ln, ln

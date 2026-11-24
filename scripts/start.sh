@@ -114,14 +114,53 @@ _resolve_worker_model() {
   printf '%s' "${result}"
 }
 
+# --- 束ねた起動: CREWVIA_BIND_TASK=<slug>/<tid> (モデルの段上げ PR-2。設計 knowledge/model-escalation.md §4.3-3・§4.5) ---
+# 段上げした task 専用の Worker を起動する。モデルは card から `plan.sh model-for` で取る (**1 か所**。値の検査 =
+# check_mission_slug / check_task_id も plan.sh 側。start.sh は値を渡すだけ)。決められない (値が壊れている・card が無い・
+# model_override が壊れている・exit 1) ときは **起動しない** — 束ねの無い Worker が普通に task を取るより安全。
+# dry-run (CREWVIA_PRINT_MODEL=1) と実際の起動の両方が、ここで決めた BIND_MODEL を使う。
+# queue は REPO_ROOT/queue を**明示して渡す**: start.sh は後で CREWVIA_QUEUE を同じ値に固定するが、ここは固定の前なので、
+# 引き継いだ env (別の queue を指しうる) を読ませると card の解決が起動後の Worker と食い違う。
+BIND_TASK=""
+BIND_MODEL=""
+BIND_ERR=""
+BIND_PULL_FLAGS=""
+BIND_SOURCE="skill"
+if [[ -n "${CREWVIA_BIND_TASK:-}" ]]; then
+  BIND_TASK="${CREWVIA_BIND_TASK}"
+  if [[ "${ROLE}" != "worker" ]]; then
+    BIND_ERR="CREWVIA_BIND_TASK は worker の起動にだけ使えます (role: ${ROLE})"
+  elif [[ "$BIND_TASK" != */* || "${BIND_TASK#*/}" == */* || "${BIND_TASK%%/*}" == "" || "${BIND_TASK#*/}" == "" ]]; then
+    BIND_ERR="CREWVIA_BIND_TASK は <mission_slug>/<task_id> の形です"
+  else
+    _BIND_SLUG="${BIND_TASK%%/*}"
+    _BIND_TID="${BIND_TASK#*/}"
+    if _BIND_OUT="$(CREWVIA_QUEUE="${REPO_ROOT}/queue" bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" --source 2>/dev/null)" \
+        && BIND_MODEL="$(printf '%s\n' "$_BIND_OUT" | sed -n 1p)" && [[ -n "$BIND_MODEL" ]]; then
+      BIND_SOURCE="$(printf '%s\n' "$_BIND_OUT" | sed -n 2p)"
+      [[ "$BIND_SOURCE" == "override" ]] || BIND_SOURCE="skill"      # card に model_override が無い束ね = skills の既定 (override と書かない)
+      BIND_PULL_FLAGS="--task ${_BIND_TID} --mission ${_BIND_SLUG} "
+    else
+      BIND_MODEL=""
+      BIND_ERR="plan.sh model-for が ${BIND_TASK} の実効モデルを決められませんでした (値の形・card の有無・model_override・config を確認: bash scripts/plan.sh model-for <tid> --mission <slug>)"
+    fi
+  fi
+fi
+
 # --- dry-run モード: CREWVIA_PRINT_MODEL=1 ---
 # AGENT_NAME 割り当て・registry 書き込みなど副作用のある処理より前に exit する。
 # QA が何度実行しても registry / worktree を汚さない。
 if [[ "${CREWVIA_PRINT_MODEL:-0}" == "1" ]]; then
+  if [[ -n "$BIND_ERR" ]]; then
+    echo "[crewvia] ERROR: $BIND_ERR" >&2
+    exit 1
+  fi
   if [[ "${ROLE}" == "director" ]]; then
     echo "${CREWVIA_DIRECTOR_MODEL:-}"
   elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
     echo "${CREWVIA_WORKER_MODEL:-}"
+  elif [[ -n "$BIND_MODEL" ]]; then
+    echo "$BIND_MODEL"
   else
     _SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
     echo "$(_resolve_worker_model "${_SKILLS_CSV}")"
@@ -653,11 +692,30 @@ fi
 #   1. CREWVIA_WORKER_MODEL が起動前から明示的に設定されていた (WORKER_MODEL_EXPLICIT=1) → 最優先
 #   2. それ以外 → _resolve_worker_model() で skill に応じたモデルを解決 (model_per_skill 適用)
 #   3. resolver が空を返した → --model を付けない (claude CLI のデフォルトに委ねる)
+if [[ -n "$BIND_ERR" ]]; then
+  # 束ねた起動で実効モデルを決められない → 起動しない (副作用より前。refusals.log にも残す)
+  echo "[crewvia] ERROR: $BIND_ERR" >&2
+  _log_refusal bind-task "$BIND_ERR"
+  exit 1
+fi
 if [[ "${ROLE}" == "director" ]]; then
   SELECTED_MODEL="${CREWVIA_DIRECTOR_MODEL:-}"
 elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
   # ユーザーが env var で明示指定 → skill mapping を使わず env var を尊重
   SELECTED_MODEL="${CREWVIA_WORKER_MODEL:-}"
+  # 束ねた起動で、明示 env が card の実効モデルより低い: 人の明示が勝つが 1 行警告する (§4.5)。
+  if [[ -n "$BIND_MODEL" ]] && python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import lib_model as m
+env, card = m.alias_of(sys.argv[2]), m.alias_of(sys.argv[3])
+sys.exit(0 if env is not None and card is not None and m.ESCALATION_LADDER.index(env) < m.ESCALATION_LADDER.index(card) else 1)
+' "$SCRIPT_DIR" "$SELECTED_MODEL" "$BIND_MODEL"; then
+    echo "[crewvia] WARNING: CREWVIA_WORKER_MODEL=${SELECTED_MODEL} は ${BIND_TASK} の実効モデル ${BIND_MODEL} より低いですが、明示の env を優先します" >&2
+  fi
+elif [[ -n "$BIND_MODEL" ]]; then
+  # 束ねた起動: card の実効モデル (model_override があればそれ・無ければ skills の既定)
+  SELECTED_MODEL="$BIND_MODEL"
 else
   # skill に応じてモデルを自動選択 (_resolve_worker_model は dry-run と同じ helper を使う)
   SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
@@ -667,6 +725,8 @@ fi
 # env = 人が起動前に CREWVIA_WORKER_MODEL を明示 / skill = model_per_skill か worker_model / none = 解決が空
 if [[ "${ROLE}" == "worker" && "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
   SELECTED_MODEL_SOURCE="env"
+elif [[ -n "$BIND_MODEL" ]]; then
+  SELECTED_MODEL_SOURCE="$BIND_SOURCE"
 elif [[ -n "$SELECTED_MODEL" ]]; then
   SELECTED_MODEL_SOURCE="skill"
 else
@@ -674,13 +734,20 @@ else
 fi
 # 使ったモデルの記録 (段上げ PR-1・registry/workers/<Name>/model.json。設計 §4.2)。pull が card の execution_model に写す。
 # mux でも inline でも書く (inline = CREWVIA_MUX_ENABLED=0 も pull する Worker。書く場所を分岐の中に閉じ込めない)。
-# 書けなくても起動は止めない: 記録の無い Worker は execution_model を書かないだけ (割り当ては変わらない)。
-# 同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。mux は「既に居る」(10/11) で終わった呼び出しが
-# 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
+# 書けなければ起動しない (fail-closed。下の関数の中を参照)。同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。
+# mux は「同じ名前の窓が生きているか」を mux_spawn の 1 か所 (10/11) で判定し、空いていると決めた後・起動の直前に
+# --pre-launch-cmd でこの記録を書く。生きた Worker が居れば記録のコマンドは走らず model.json は変わらない。
+# 起動に失敗しても記録は消さない (退避・復元もしない)。inline は exec の直前に下の関数を呼ぶ。
 _record_worker_model() {
-  python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
-    "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" >/dev/null \
-    || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
+  # 記録は割り当ての根拠 (bound_task / source) なので、書けなければ**常に失敗を返す** (呼び側が起動した Worker を止める = fail-closed)。
+  # 束ねの有無で分けない: 書けないまま続行すると、同名の前任の読める記録 (source=env・古い bound_task) が
+  # 新しい Worker の許可として残る (PR-2 Codex 2 巡目 P2)。
+  if python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+      "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" "$BIND_TASK" >/dev/null; then
+    return 0
+  fi
+  echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録を書けませんでした (bound_task=${BIND_TASK:-なし}) — 前任の記録が残ると他の task を取りうるので起動しません" >&2
+  return 1
 }
 
 MODEL_FLAG=()
@@ -947,10 +1014,25 @@ PYEOF
   # be reported as "already running".  Every other failure — including a
   # relaunch into an empty pane that did not take, after which the name is still
   # in `mux_list` — used to fall into the same message.
+  # model.json は spawn が「この名前は空いている」と判断した後・起動する直前に書く (設計 §4.2)。
+  # 窓が見えてから記録までの隙に dispatcher が「記録なし」と見て退役させる・前任の記録で誤割り当てする経路を閉じる。
+  # 「同じ名前の窓が生きているか」の判定は mux_spawn (lib_mux の 4 backend) の 1 か所に任せ、その判定の後に
+  # --pre-launch-cmd で記録を書く。生きた Worker が居れば (10/11) 記録のコマンドは走らず、model.json は 1 バイトも変わらない。
+  # 書けなければ spawn しない (12・fail-closed)。spawn が失敗しても記録は消さない: 失敗しても Worker が起動していないとは
+  # 限らない (hc の server identity / write_pane_record の失敗・Rex の block 起動後の失敗)。記録は「空きと決めた直後」にしか
+  # 書かないので、その名前の Worker が居なければ残った記録は誰の許可にもならない (設計 §4.2・§12)。退避・復元・印の一時ファイルは持たない。
+  _MODEL_REC_ARGS=()
+  if [[ "${ROLE}" == "worker" ]]; then
+    _MODEL_REC_CMD="python3 $(_shq "${SCRIPT_DIR}/lib_worker_model.py") record $(_shq "${REPO_ROOT}/registry") $(_shq "$AGENT_NAME") $(_shq "$SELECTED_MODEL_SOURCE") $(_shq "$SELECTED_MODEL") $(_shq "$BIND_TASK") >/dev/null"
+    _MODEL_REC_ARGS=(--pre-launch-cmd "$_MODEL_REC_CMD")
+  fi
   SPAWN_RC=0
-  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" || SPAWN_RC=$?
+  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" "${_MODEL_REC_ARGS[@]+"${_MODEL_REC_ARGS[@]}"}" || SPAWN_RC=$?
   if [[ $SPAWN_RC -ne 0 ]]; then
     case $SPAWN_RC in
+      12) echo "[crewvia] ERROR: $AGENT_NAME のモデルの記録を書けませんでした (bound_task=${BIND_TASK:-なし}) — 前任の記録が残ると他の task を取りうるので起動しません" >&2
+          _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"
+          exit 1 ;;
       10) echo "[crewvia] $WINDOW_NAME is already running — not launching a second one" ;;
       11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
           echo "          確認: mux_capture $WINDOW_NAME (中身が空の shell なら mux_kill $WINDOW_NAME してから再実行)" >&2 ;;
@@ -986,7 +1068,6 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
-    _record_worker_model
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
@@ -1010,9 +1091,9 @@ PYEOF
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
       if [[ -n "${TARGET_DIR:-}" ]]; then
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull ${BIND_PULL_FLAGS}--agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       else
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull ${BIND_PULL_FLAGS}--agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       fi
     else
       KICKOFF_MSG="ミッション開始。plan status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
@@ -1139,7 +1220,9 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
-  [[ "${ROLE}" == "worker" ]] && _record_worker_model
+  if [[ "${ROLE}" == "worker" ]]; then
+    _record_worker_model || { _log_refusal bind-task-record "model.json を書けないので ${AGENT_NAME} の起動を止めました (bound=${BIND_TASK:-なし})"; exit 1; }
+  fi
   # herdr server 汚染の伝播を防ぐため exec 直前に除去する (mux 経由と同様の防御)。
   unset CLAUDE_CODE_CHILD_SESSION
   # 二重防御: unset が漏れても transcript 保存を公式 env var で保証する (→ t004)。

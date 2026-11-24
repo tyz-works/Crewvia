@@ -180,6 +180,66 @@ def resolve(config_path: str, skills_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# モデルの段上げ (PR-2。設計 knowledge/model-escalation.md §4.4・§4.5・§5)
+# ---------------------------------------------------------------------------
+#: 段の別名とその順 (低 → 高)。**ここに 1 回だけ書く**。`model_override` の検査 (plan.sh の update・lint・store-check・
+#: dispatcher・pull) は全部これを import する。ランクは `_model_rank` と同じく部分文字列で見る (版つき ID も同じ段)。
+ESCALATION_LADDER = ("haiku", "sonnet", "opus")
+
+
+def is_alias(value) -> bool:
+    """`model_override` に書いてよい値か: 別名だけ (小文字・完全一致。版つき ID・空・bool・None は不可)。"""
+    return isinstance(value, str) and value in ESCALATION_LADDER
+
+
+def alias_of(model):
+    """モデル ID (別名でも版つきでも) が属する段の別名。段に無い (`fable` 等・空・文字列でない) は None。
+    `_model_rank` と違って警告も出さず、未知を sonnet に倒さない (段上げの起点にしてよいかの判定に使う)。"""
+    if not isinstance(model, str):
+        return None
+    m = model.lower()
+    for alias in ESCALATION_LADDER:
+        if alias in m:
+            return alias
+    return None
+
+
+def escalation_base(*candidates):
+    """段上げの起点: 候補 (閉じた試行の `execution_model` → 今の `model_override` → 既定モデルの順) の最初の
+    **段の分かるもの** (§4.2)。どれも分からなければ None。起点が分からないことを理由に段上げを止めない
+    ための順で、知らない名前は飛ばして次を見る。"""
+    for c in candidates:
+        if alias_of(c) is not None:
+            return c
+    return None
+
+
+def escalate(base, override=None):
+    """`base` の 1 段上の別名 (opus で止まる)。既に `override` があればそれより下げない (`max(override, base + 1)`)。
+    `base` の段が分からず `override` も無ければ None (呼び出し側が「段上げしない」を決める)。"""
+    cur = alias_of(base)
+    ov = override if is_alias(override) else None
+    if cur is None:
+        return ov
+    idx = min(ESCALATION_LADDER.index(cur) + 1, len(ESCALATION_LADDER) - 1)
+    if ov is not None:
+        idx = max(idx, ESCALATION_LADDER.index(ov))
+    return ESCALATION_LADDER[idx]
+
+
+def effective_model(config_path: str, skills, override=None) -> str:
+    """その task を走らせるべきモデル (実効モデル。§5): `override` (別名) があればそれ、無ければ既定モデル (`resolve`)。
+    env の明示 (`CREWVIA_WORKER_MODEL`) は Worker 側の事情なので含めない。`skills` は list か CSV。
+    `override` が別名でない (壊れた値) ときは ValueError (既定に黙って倒さない)。"""
+    if override is not None:
+        if not is_alias(override):
+            raise ValueError(f"model_override {override!r} is not one of {list(ESCALATION_LADDER)}")
+        return override
+    csv = ",".join(skills) if isinstance(skills, (list, tuple, set)) else (skills or "")
+    return resolve(config_path, csv)
+
+
+# ---------------------------------------------------------------------------
 # CLI エントリーポイント
 # ---------------------------------------------------------------------------
 def main() -> None:

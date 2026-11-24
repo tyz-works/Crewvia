@@ -25,6 +25,9 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 START_SH="${REPO_ROOT}/scripts/start.sh"
+source "$(dirname "$BATS_TEST_FILENAME")/bats_sandbox.sh"   # t006: 実 checkout の registry/ を書かない隔離
+setup() { bats_sandbox_create; }
+
 source "$(dirname "$BATS_TEST_FILENAME")/trust_fixture.sh"   # t021: start.sh の trust 事前検査を通す偽の設定
 
 setup_fake_env() {
@@ -96,6 +99,7 @@ teardown() {
     # start.sh writes the worker system prompt into WORK_DIR/.claude/settings.local.json
     # (gitignored) when reaching the mux/prompt-write path — clean it up.
     rm -f "${REPO_ROOT}/.claude/settings.local.json"
+    bats_sandbox_destroy
 }
 
 @test "ROLE=worker + CREWVIA_MUX=tmux + CREWVIA_MUX_ENABLED unset uses parallel mode, not inline (t002 fix)" {

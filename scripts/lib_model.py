@@ -281,16 +281,26 @@ def default_model(config_path: str, skills):
     except Exception:  # noqa: BLE001
         return None, 'config_unreadable'
     wanted = [s.strip() for s in csv.split(",") if s.strip()]
-    worker_model = config.get("worker_model", "") or ""
-    per_skill = config.get("model_per_skill", {}) or {}
-    if not wanted:
-        return worker_model, None
-    best, best_rank = "", -1
-    for skill in sorted(wanted):
-        cand = (per_skill[skill] or "") if skill in per_skill else worker_model
-        if cand and _model_rank(cand) > best_rank:
-            best, best_rank = cand, _model_rank(cand)
-    return best, None
+    try:
+        if not isinstance(config, dict):
+            return None, 'config_unreadable'
+        worker_model = config.get("worker_model", "") or ""
+        per_skill = config.get("model_per_skill", {}) or {}
+        # 値の型が違う (worker_model: 123・model_per_skill: 123 / list・skill の値が数値など) = 読めない扱い。例外にしない。
+        if not isinstance(worker_model, str) or not isinstance(per_skill, dict):
+            return None, 'config_unreadable'
+        if not wanted:
+            return worker_model, None
+        best, best_rank = "", -1
+        for skill in sorted(wanted):
+            cand = (per_skill[skill] or "") if skill in per_skill else worker_model
+            if not isinstance(cand, str):
+                return None, 'config_unreadable'
+            if cand and _model_rank(cand) > best_rank:
+                best, best_rank = cand, _model_rank(cand)
+        return best, None
+    except Exception:  # noqa: BLE001
+        return None, 'config_unreadable'
 
 
 def want_escalation(command, *, cause=None, escalate_model=False, no_escalate=False) -> bool:

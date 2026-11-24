@@ -342,7 +342,7 @@ required_evidence:
 - 例外の上書き: `--escalate-model` / `--no-escalate`。`--cause mechanical --escalate-model`・`--cause quality --no-escalate` のような食い違いは使い方の誤り（exit 3）。review / qa / codex-review の task は常に上げない（`MODEL_ESCALATION_NOT_APPLICABLE`）。cascade で戻る下流も上げない。
 - `verify-result fail` は検証者が出来を断った = 品質の差し戻しなので**既定で上げる**（`--no-escalate` で止める）。`retry` は既定で上げない（Worker の停止・環境の失敗が大半）。品質由来の `failed` を再挑戦させるときだけ `--escalate-model`。
 - opus のまま 2 回差し戻された task は dispatcher が `[model-at-cap]` で 1 回通知する（3 回目以降は送らない）。task の分割・設計の見直しの合図。`update --model-override none` で数え直し。
-- config が読めず既定モデルが分からないときは差し戻しだけ進み、段上げは飛ぶ（stderr の `MODEL_ESCALATION_SKIPPED:config_unreadable`）。
+- config が**無い**・モデルの値の型が違う（`worker_model: 123` 等）ために既定モデルが分からないときは差し戻しだけ進み、段上げは飛ぶ（stderr の `MODEL_ESCALATION_SKIPPED:config_unreadable`）。**config が YAML として壊れているときは reopen / retry が段上げより前に exit 1・何も書かずに断る**（既存の `attempts.max_total` の読み込み。`config/crewvia.local.yaml` を直すか一時的に退避する）。verify-result fail は進む。
 
 **新 task を足すほうがよい場面**: 修正が**別の PR** になる（merge 済みの PR への追従を含む）／元の task と範囲が違う（別の deliverable・別の skills・別のファイル群）／元の task の Result を書き換えたくない（監査上、完了した作業の記録を残したい）／上限に達していて続ける理由が無い。
 

@@ -266,7 +266,8 @@ CREWVIA_WORKER_MODEL（起動前に人が設定。WORKER_MODEL_EXPLICIT=1）
 | Worker の `model.json` が無い | `model_override` の無い task は取れる・ある task は取らない（§4.3 の表）。override の task しか残らなければ**退役でよい**（§4.3 の 5。永久に取れないので待つ理由が無い） | PR-1 の前に起動した Worker を止めない（`lib_worker_target` と同じ向き） |
 | `model.json` が読めない・壊れている（missing でない） | 「無い」と同じ扱い**ではない**: 束ねられているか分からないので、`model_override` の無い task も**取らない**（保留）+ dispatcher のログに 1 回。**退役もさせない（待機）**（§4.3 の 5。`_rec_known` と同じ） | 束ねた Worker が別の task を取るのを防ぐ側。かつ観測できなかったことを根拠に破壊（退役）しない。`is_missing` と壊れたを取り違えない（memory `load-json-store-missing-is-also-unreadable`） |
 | 前の試行の `execution_model` が無い・知らない名前（`fable` 等の段に無いモデル） | 起点を `model_override` → 既定モデルの順に探す（§4.2） | 起点が分からないことを理由に段上げを止めない |
-| 既定モデルも決められない（config が `Unreadable`） | **reopen / retry / verify-result fail は進める・段上げはしない**・stderr に固定コード `MODEL_ESCALATION_SKIPPED:config_unreadable`・台帳に `model_escalation: skipped:config_unreadable` | 差し戻しは Director の主要な出口で、config の壊れで止めると出口が消える（§11-4 = a） |
+| 既定モデルも決められない（config が**無い**・`worker_model` / `model_per_skill` の**値の型が違う**（数値・list 等。`lib_model.default_model` が例外にせず `config_unreadable` を返す）） | **reopen / retry / verify-result fail は進める・段上げはしない**・stderr に固定コード `MODEL_ESCALATION_SKIPPED:config_unreadable`・台帳に `model_escalation: skipped:config_unreadable` | 差し戻しは Director の主要な出口で、モデルの値の不備で止めると出口が消える（§11-4 = a） |
+| **YAML として壊れた** config（`crewvia.yaml` / `crewvia.local.yaml`） | **reopen / retry は段上げの判定より前**に既存の `attempts.max_total` の読み込み（`_default_cap_or_refuse`）で **exit 1・何も書かずに断る**（既存の「壊れた config は既定値に倒さない」規則。出口は local.yaml を直すか一時的に退避）。**verify-result fail は進む**（総試行数の上限を読まないので `skipped:config_unreadable` で進む） | §11-4 の (a) は「モデルの値が決められない」場合の規則。YAML の壊れは上限の読み込みという別の既存規則が先に断るので、段上げのために新しい例外を作らない（attempt 2・Director の選択 = 案 a） |
 | reopen の intent が v1（PR-3 の前に書かれ、完了していない） | 新しいコードが**段上げなしで完了させる**（`model` 欄が無い = 段上げしない。v1 の時点の決定には段上げが含まれていない）。`model_at_cap_count` も触らない | 決定のコミット点は intent。回復で決定を足さない（「一覧を作り直さない」と同じ原則） |
 | `CREWVIA_BIND_TASK` の値が壊れている・card が無い・`model-for` が exit 1 | start.sh は**起動しない**（exit 1・`logs/start-sh/refusals.log`） | 束ねの無い Worker が起動して普通に task を取るより安全 |
 | 明示 env の値が段に無い名前 | 今どおり（`lib_model` の警告だけ・そのまま `--model` に渡す）。記録には書く | 人の明示は通す（今の挙動） |
@@ -363,7 +364,7 @@ PR-1 と PR-2 は独立に revert できる。PR-3 は PR-2 の上でだけ意�
 | 1 | 検証の差し戻しと retry | **(a)** `verify-result fail`（task が直接 pending に戻る）でも上げる。retry は既定で上げず、`--escalate-model` のときだけ上げる | (b) verify-result fail も上げない（決定 (A) の文面どおり review / QA / Codex だけ）／(c) (a) に加え retry の `WORKER_FAILED` も上げる | §0・§4.1・§6・§8 |
 | 2 | Codex の NEEDS FIX の後 | **(a)** 正しい出口は実装 task の reopen（= 上がる）。codex-review task 自体の retry（Codex を走らせ直す）は上げない | (b) needs-director の codex-review task の retry で上流の実装 task にも override を付ける | §4.1 |
 | 3 | opus で再び差し戻されたとき | **(b)** opus での差し戻しが 2 回目になったら Director に 1 回通知（止めない・理由も求めない） | (a) opus のまま黙って続ける（`at_cap` だけ）／(c) opus での差し戻しは `--over-cap` と同じく理由を必須にする | §0・§4.4・§4.6・§8 |
-| 4 | 既定モデルが決められない（config が壊れている）ときの差し戻し | **(a)** 差し戻しは進め、段上げだけ飛ばす | (b) reopen を断る（`--no-escalate` を付ければ通る） | §4.8 |
+| 4 | 既定モデルが決められない（config が壊れている）ときの差し戻し | **(a)** 差し戻しは進め、段上げだけ飛ばす | (b) reopen を断る（`--no-escalate` を付ければ通る） | §4.8 | 注 (attempt 2): (a) が及ぶのは config が無い・モデルの値の型違い。YAML として壊れた config は reopen / retry が `attempts.max_total` の読み込みで先に断る（§4.8）。
 | 5 | 最初から上げた状態で task を作れるようにするか | **(a)** `add` は受け付けない。`update --model-override` は Director の手で使える | (b) `add --model-override` も受け付ける | §4.4 |
 | 6 | task-graph に出すか | **(a)** 出さない | (b) 表示名の末尾に `[opus↑]` | §4.7 |
 | 7 | 束ねた Worker の起動 | **(a)** 今の運用どおり Director が通知のコマンドを貼って起動する | (b) dispatcher が自分で起動する（別の設計・範囲外） | §4.3 |

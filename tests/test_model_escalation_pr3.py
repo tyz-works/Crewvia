@@ -190,7 +190,7 @@ def test_reopen_of_a_review_task_is_never_escalated(box):
     assert ev["model_escalation"] == "not_applicable"
 
 
-def test_reopen_without_a_readable_config_proceeds_and_skips_the_escalation(box):
+def test_reopen_without_a_config_file_proceeds_and_skips_the_escalation(box):
     _finish(box, model=None)                 # 起点が分からず、box に config も無い
     set_card(box, "t001", execution_model=None)
     p = _reopen(box, "--cause", "quality")
@@ -397,3 +397,126 @@ def test_retry_escalates_only_with_the_flag(box):
     assert box.card()["model_override"] == "opus" and "→ opus（段上げ）" in p.stdout
     ev = [e for e in _ledger(box, kind="retry") if e["execution_id"] == xid2][0]
     assert (ev["model_escalation"], ev["model_to"]) == ("escalated", "opus")
+
+
+# ---------------------------------------------------------------------------
+# attempt 2: config の値の型違い (skip で進める) / YAML の壊れ (reopen・retry が先に断る)
+# ---------------------------------------------------------------------------
+
+BAD_TYPE_CONFIGS = [
+    "worker_model: 123\n",
+    "model_per_skill: 123\n",
+    "model_per_skill: [a, b]\n",
+    "model_per_skill:\n  code: 123\n",
+    "model_per_skill:\n  code: [opus]\n",
+    "worker_model: [sonnet]\n",
+]
+
+
+@pytest.mark.parametrize("text", BAD_TYPE_CONFIGS)
+def test_default_model_never_raises_on_wrong_typed_values(tmp_path, text):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(text)
+    assert lm.default_model(str(cfg), ["code"]) == (None, "config_unreadable")
+    d = _decide(closed=None, config=str(cfg))
+    assert (d["code"], d["applied"]) == ("skipped:config_unreadable", False)
+
+
+def _write_config(box, text):
+    cfg = box.root / "config"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "crewvia.yaml").write_text(text)
+
+
+@pytest.mark.parametrize("text", BAD_TYPE_CONFIGS)
+def test_reopen_quality_proceeds_with_a_wrong_typed_model_value(box, text):
+    _finish(box, model=None)
+    set_card(box, "t001", execution_model=None)
+    _write_config(box, text)
+    p = _reopen(box, "--cause", "quality")
+    assert p.returncode == 0, p.stderr
+    assert "MODEL_ESCALATION_SKIPPED:config_unreadable" in p.stderr
+    assert "model_override" not in box.card() and box.card()["status"] == "pending"
+
+
+@pytest.mark.parametrize("text", BAD_TYPE_CONFIGS)
+def test_retry_escalate_model_proceeds_with_a_wrong_typed_model_value(box, text):
+    xid = take(box, "Ren")
+    assert run(box, "fail", "t001", "--no-head", "x", "--mission", MISSION, "--execution", xid).returncode == 0
+    set_card(box, "t001", execution_model=None)
+    _write_config(box, text)
+    p = run(box, "retry", "t001", "--reason", "again", "--escalate-model", "--mission", MISSION, agent="Director")
+    assert p.returncode == 0, p.stderr
+    assert "MODEL_ESCALATION_SKIPPED:config_unreadable" in p.stderr
+    assert "model_override" not in box.card() and box.card()["status"] == "pending"
+
+
+@pytest.mark.parametrize("text", BAD_TYPE_CONFIGS)
+def test_verify_result_fail_proceeds_with_a_wrong_typed_model_value(box, text):
+    xid = take(box, "Ren")
+    set_card(box, "t001", execution_model=None)
+    _to_verification(box, xid)
+    _write_config(box, text)
+    p = run(box, *e3.report_argv("verify-fail"), "--execution", xid, agent="V1")
+    assert p.returncode == 0, p.stderr
+    assert "MODEL_ESCALATION_SKIPPED:config_unreadable" in p.stderr
+    assert box.card()["status"] == "pending" and "model_override" not in box.card()
+
+
+def test_reopen_and_retry_refuse_a_broken_yaml_config_and_write_nothing(box):
+    _finish(box, model="sonnet")
+    _write_config(box, "attempts: [unclosed\n  max_total: : :\n")
+    p = _reopen(box, "--cause", "quality")        # recover_before の projection 追従 (record の model) は断る前に走る。断りの書き込みはその後に 0
+    assert p.returncode == 1, p.stderr
+    assert "config が読めません" in p.stderr and "何も書いていません" in p.stderr
+    before = box.snapshot()
+    p = _reopen(box, "--cause", "quality")
+    assert p.returncode == 1, p.stderr
+    assert box.snapshot() == before
+    assert box.card()["status"] == "done" and not _ledger(box) and "model_override" not in box.card()
+    # retry (failed の card) も同じ入口で断る
+    _write_config(box, "")
+    xid = take(box, "Sora", "t002")
+    assert run(box, "fail", "t002", "--no-head", "x", "--mission", MISSION, "--execution", xid).returncode == 0
+    _write_config(box, "attempts: [unclosed\n  max_total: : :\n")
+    p = run(box, "retry", "t002", "--reason", "again", "--escalate-model", "--mission", MISSION, agent="Director")
+    assert p.returncode == 1, p.stderr
+    before = box.snapshot()
+    p = run(box, "retry", "t002", "--reason", "again", "--escalate-model", "--mission", MISSION, agent="Director")
+    assert p.returncode == 1, p.stderr
+    assert box.snapshot() == before
+    assert not _ledger(box, tid="t002", kind="retry")
+
+
+# ---------------------------------------------------------------------------
+# dispatcher の model-at-cap 通知 (§4.6)
+# ---------------------------------------------------------------------------
+
+def _cap_cycle_messages(h):
+    return [m for m in h.cycle(ttl_expired=True) if m.startswith("[model-at-cap]")]
+
+
+@pytest.fixture
+def cap_h(tmp_path, monkeypatch):
+    from test_dispatcher_notify_once import Harness
+    return Harness(tmp_path / "repo", monkeypatch)
+
+
+CAP_X = "ex-" + "d" * 32
+
+
+def test_model_at_cap_notice_once_at_two_and_not_again_at_three(cap_h):
+    cap_h.card("t001", "pending", model_override="opus", model_at_cap_count=1, model_at_cap_execution=CAP_X)
+    assert _cap_cycle_messages(cap_h) == []                        # 1 回目 (count=1) は送らない
+    cap_h.card("t001", "pending", model_override="opus", model_at_cap_count=2, model_at_cap_execution=CAP_X)
+    first = _cap_cycle_messages(cap_h)
+    assert len(first) == 1 and "t001" in first[0]
+    assert _cap_cycle_messages(cap_h) == []                        # 同じ状態は再送しない
+    cap_h.card("t001", "pending", model_override="opus", model_at_cap_count=3, model_at_cap_execution=CAP_X)
+    assert _cap_cycle_messages(cap_h) == []                        # 3 回目以降は ID が動かない = 送らない
+
+
+@pytest.mark.parametrize("x", [None, "", "ex-short", "EX-" + "d" * 32, "ex-" + "D" * 32, 123])
+def test_model_at_cap_notice_needs_a_well_formed_execution_id(cap_h, x):
+    cap_h.card("t001", "pending", model_override="opus", model_at_cap_count=2, model_at_cap_execution=x)
+    assert _cap_cycle_messages(cap_h) == []

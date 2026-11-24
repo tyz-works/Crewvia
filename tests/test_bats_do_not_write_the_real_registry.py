@@ -50,7 +50,7 @@ def _registry_files(root: Path):
     return sorted(str(p.relative_to(root)) for p in reg.rglob("*") if p.is_file()) if reg.exists() else []
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def checkout_copy(tmp_path_factory):
     dest = tmp_path_factory.mktemp("checkout")
     _copy_checkout(dest)
@@ -59,7 +59,7 @@ def checkout_copy(tmp_path_factory):
 
 @pytest.mark.parametrize("bats_file,only", LEAKY_FILES, ids=[f for f, _ in LEAKY_FILES])
 def test_bats_leaves_the_checkouts_registry_untouched(checkout_copy, bats_file, only):
-    assert _registry_files(checkout_copy) == [], "複製の時点で registry/ が空であること"
+    assert _registry_files(checkout_copy) == [], f"{bats_file}: 複製の時点で registry/ が空であること"
     # 開発者のシェルに近い最小の env (CREWVIA_* のテスト印・pytest の PYTHONPATH 等を持ち込まない)
     env = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"]}
     r = subprocess.run(["bats", "--filter", only, bats_file], cwd=checkout_copy, env=env,

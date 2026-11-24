@@ -3395,6 +3395,19 @@ def _herdr_pane_get_bound(pane_id: str, server,
         sock.close()
 
 
+def _herdr_panes(data) -> Optional[list]:
+    """`pane list` の応答から panes を読む。形が読めなければ None (= 占有が観測できない)。
+
+    読める形 = result.panes が list で、要素が全部 dict。1 つでも dict でない要素 (文字列・None・list) が
+    あれば一覧全体を「読めない」とする (その要素が目的の label の pane かもしれない = 空きとは言えない)。
+    """
+    res = data.get("result") if isinstance(data, dict) else None
+    panes = res.get("panes") if isinstance(res, dict) else None
+    if not isinstance(panes, list) or not all(isinstance(p, dict) for p in panes):
+        return None
+    return panes
+
+
 class HerdrBackend(_Backend):
     """herdr terminal workspace manager backend (Phase 2).
 
@@ -3531,7 +3544,9 @@ class HerdrBackend(_Backend):
         data = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
         if data is None:
             return None
-        panes = data.get("result", {}).get("panes", [])
+        panes = _herdr_panes(data)
+        if panes is None:
+            return None  # 形が読めない = 見つからない (kill / 起動の根拠にしない側)
         for pane in panes:
             if pane.get("label") == _pane_name(name):
                 return {
@@ -3750,16 +3765,14 @@ class HerdrBackend(_Backend):
         existing = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
         # _herdr_run は失敗 (非 0) でも stdout/stderr の JSON を返す。result.panes が list の
         # 成功応答だけを一覧として読む (エラー応答を空の一覧と読むと hook と tab create に進む)。
-        _res = existing.get("result") if isinstance(existing, dict) else None
-        if not isinstance(_res, dict) or not isinstance(_res.get("panes"), list):
-            existing = None
-        if existing is None:
+        # 要素が dict でない一覧 (文字列・None・list) も読めない扱い (pane.get で例外にしない)。
+        panes = _herdr_panes(existing)
+        if panes is None:
             # 占有が観測できない = 空いているとは言えない。tab create に進むと pre-launch hook が走り、
             # 生きた Worker の記録を書き換えうる。他の backend と同じく fail-closed (SPAWN_UNREADABLE)。
             self._warn(f"spawn {name!r}: could not list panes; nothing was launched")
             self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
-        panes = existing.get("result", {}).get("panes", [])
         for pane in panes:
             if pane.get("label") != _pane_name(name):
                 continue
@@ -3958,7 +3971,9 @@ class HerdrBackend(_Backend):
         data = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
         if data is None:
             return []
-        panes = data.get("result", {}).get("panes", [])
+        # list() に「読めない」を返す口は無い (data None も [] のまま)。形の崩れた一覧は
+        # 空と読み、起動の可否は spawn の fail-closed (SPAWN_UNREADABLE) が止める。例外では抜けない。
+        panes = _herdr_panes(data) or []
         prefix = _pane_prefix()
         names = [_caller_name(p["label"]) for p in panes
                  if p.get("label") and p["label"].startswith(prefix)]

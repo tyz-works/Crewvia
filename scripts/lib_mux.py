@@ -3748,6 +3748,11 @@ class HerdrBackend(_Backend):
 
         # Check for existing pane with this name.
         existing = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
+        # _herdr_run は失敗 (非 0) でも stdout/stderr の JSON を返す。result.panes が list の
+        # 成功応答だけを一覧として読む (エラー応答を空の一覧と読むと hook と tab create に進む)。
+        _res = existing.get("result") if isinstance(existing, dict) else None
+        if not isinstance(_res, dict) or not isinstance(_res.get("panes"), list):
+            existing = None
         if existing is None:
             # 占有が観測できない = 空いているとは言えない。tab create に進むと pre-launch hook が走り、
             # 生きた Worker の記録を書き換えうる。他の backend と同じく fail-closed (SPAWN_UNREADABLE)。

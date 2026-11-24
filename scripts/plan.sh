@@ -3137,7 +3137,7 @@ def _default_timeout_max_for_skills(skills):
     map だけがここで安全に読める (`attempts.max_total` と同じ深さ・同じパターン)。
     """
     data = _CONFIG.load_effective(REPO_ROOT)
-    if _TASK_CARDS.is_unreadable(data):
+    if _CONFIG.is_unreadable(data):
         raise UsageExit(f"config が読めません ({data.reason})。config/crewvia.local.yaml を直すか一時的に退避してください。"
                         "何も書いていません")
     mapping = data.get('timeout_max_per_skill')

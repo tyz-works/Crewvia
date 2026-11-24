@@ -43,3 +43,21 @@ def test_readable_empty_pane_list_still_spawns(monkeypatch):
     b, calls, ran = _backend(monkeypatch, {"result": {"panes": []}})
     assert b.spawn("Omar-worker", "true") is True
     assert "tab_create" in calls and ran == [1]
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("resp", [
+    {"error": {"code": "workspace_not_found", "message": "x"}},   # エラー応答 (非 0 でも JSON が返る)
+    {},                                                            # result 無し
+    {"result": {}},                                                # panes 無し
+    {"result": {"panes": None}},                                   # list でない
+    {"result": {"panes": {"a": 1}}},
+])
+def test_error_shaped_pane_list_refuses_like_unreadable(monkeypatch, resp):
+    b, calls, ran = _backend(monkeypatch, resp)
+    assert b.spawn("Omar-worker", "true") is False
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+    assert calls == ["pane_list"]
+    assert ran == []

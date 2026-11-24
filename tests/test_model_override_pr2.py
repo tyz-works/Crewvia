@@ -724,3 +724,14 @@ def test_model_for_with_an_unreadable_config_exits_1_with_empty_stdout(box, over
     (box.root / "config" / "crewvia.yaml").write_text("worker_model: [unclosed\n  : : :\n")
     r = box.plan("model-for", "t001", "--mission", MISSION)
     assert r.returncode == 1 and r.stdout == "", (r.returncode, r.stdout, r.stderr)
+
+
+def test_plan_add_review_with_an_unreadable_config_is_a_clean_usage_error_and_writes_nothing(box):
+    # _default_timeout_max_for_skills も config 側の述語で判定する (TypeError の traceback にしない)
+    (box.root / "config" / "crewvia.yaml").write_text("worker_model: [unclosed\n  : : :\n")
+    before = box.snapshot()
+    r = box.plan("add", "x", "--mission", MISSION, "--skills", "review", agent="Director")
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr and "TypeError" not in r.stderr
+    assert "config が読めません" in r.stderr
+    assert box.snapshot() == before

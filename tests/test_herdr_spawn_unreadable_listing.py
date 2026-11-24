@@ -61,3 +61,25 @@ def test_error_shaped_pane_list_refuses_like_unreadable(monkeypatch, resp):
     assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
     assert calls == ["pane_list"]
     assert ran == []
+
+
+@pytest.mark.parametrize("panes", [
+    ["Omar-worker"],                                  # 文字列の要素
+    [None],                                           # None の要素
+    [["label", "Omar-worker"]],                       # list の要素
+    [{"label": "other", "pane_id": "p9"}, "x"],       # 読める要素に壊れた要素が混ざる
+])
+def test_non_dict_pane_elements_refuse_like_unreadable(monkeypatch, panes):
+    """要素が dict でない一覧は『占有が観測できない』: 例外で抜けず、hook も tab create も走らない。"""
+    b, calls, ran = _backend(monkeypatch, {"result": {"panes": panes}})
+    assert b.spawn("Omar-worker", "true") is False
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+    assert calls == ["pane_list"]
+    assert ran == []
+
+
+@pytest.mark.parametrize("panes", [["x"], [None], [["a"]]])
+def test_label_lookup_and_list_do_not_raise_on_non_dict_elements(monkeypatch, panes):
+    b, calls, ran = _backend(monkeypatch, {"result": {"panes": panes}})
+    assert b._label_lookup("Omar-worker") is None      # 見つからない = kill の根拠にならない側
+    assert b.list() == []                              # list() に『読めない』の口は無い。spawn が止める

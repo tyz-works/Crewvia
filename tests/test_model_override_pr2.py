@@ -714,3 +714,13 @@ def test_resume_of_a_reservation_still_works_for_a_plain_task(box, auto):
     _seed_reserved(box)
     p = box.pull("Ren", auto=True) if auto else box.pull("Ren")
     assert p.returncode == 0, p.stderr
+
+
+@pytest.mark.parametrize("override", [None, "opus"])
+def test_model_for_with_an_unreadable_config_exits_1_with_empty_stdout(box, override):
+    # config が読めないときは override の有無を問わず exit 1・stdout 空 (判定は lib_config の述語)
+    if override:
+        assert _update(box, "--model-override", override).returncode == 0
+    (box.root / "config" / "crewvia.yaml").write_text("worker_model: [unclosed\n  : : :\n")
+    r = box.plan("model-for", "t001", "--mission", MISSION)
+    assert r.returncode == 1 and r.stdout == "", (r.returncode, r.stdout, r.stderr)

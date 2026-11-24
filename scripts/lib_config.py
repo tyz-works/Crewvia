@@ -220,6 +220,14 @@ def load_for_path(config_path=None, *, local=True):
     return load_effective(common_path=p, use_local=False)
 
 
+def is_unreadable(value):
+    """`load_effective` / `load_for_path` の結果が「読めなかった」か。
+
+    plan.sh は `lib_task_cards` を別に読み込むので、`Unreadable` の isinstance を plan.sh 側でやると
+    クラスが別物で常に偽になる。config の「読めない」判定はこの述語（lib 側のクラス）で行う。"""
+    return _cards.is_unreadable(value)
+
+
 def config_problem(config_path=None):
     """local / 共通が壊れているときの固定コード (位置つき)。読めれば None。デーモンの一度だけ通知用。"""
     cfg = load_for_path(config_path)

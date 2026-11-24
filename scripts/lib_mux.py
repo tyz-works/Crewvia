@@ -3748,42 +3748,52 @@ class HerdrBackend(_Backend):
 
         # Check for existing pane with this name.
         existing = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
-        if existing is not None:
-            panes = existing.get("result", {}).get("panes", [])
-            for pane in panes:
-                if pane.get("label") != _pane_name(name):
-                    continue
-                existing_pane_id = pane.get("pane_id") or ""
-                if not existing_pane_id:
-                    self.last_spawn_refusal = SPAWN_UNREADABLE
-                    return False
-                occupant = self._pane_process_state(existing_pane_id)
-                if occupant != PANE_IDLE:
-                    # Live agent in there (or one we cannot see past) → no-op.
-                    self.last_spawn_refusal = (
-                        SPAWN_OCCUPIED if occupant == PANE_LIVE
-                        else SPAWN_UNREADABLE)
-                    return False
-                # Husk pane: herdr restored the label but not the process.
-                # Relaunching in place keeps the tab (and its position) and is
-                # what makes ./crewvia recover on its own after a server
-                # restart — before this, spawn reported "already exists" and
-                # start.sh went on to launch nothing at all.
-                self._warn(
-                    f"spawn {name!r}: pane {existing_pane_id} is an idle shell "
-                    "(herdr restart?) — relaunching in place"
-                )
-                if not self._pre_launch_ok(name):
-                    return False
-                if _herdr_run("pane_run", [existing_pane_id, cmd], timeout=10) is None:
-                    self._warn(f"spawn {name!r}: pane run failed on reused pane")
-                    return False
-                if not _wait_until_launched(
-                        lambda: self._pane_process_state(existing_pane_id),
-                        warn=self._warn, name=name):
-                    return False
-                self._write_cache(name, pane.get("tab_id") or "", existing_pane_id)
-                return True
+        # _herdr_run は失敗 (非 0) でも stdout/stderr の JSON を返す。result.panes が list の
+        # 成功応答だけを一覧として読む (エラー応答を空の一覧と読むと hook と tab create に進む)。
+        _res = existing.get("result") if isinstance(existing, dict) else None
+        if not isinstance(_res, dict) or not isinstance(_res.get("panes"), list):
+            existing = None
+        if existing is None:
+            # 占有が観測できない = 空いているとは言えない。tab create に進むと pre-launch hook が走り、
+            # 生きた Worker の記録を書き換えうる。他の backend と同じく fail-closed (SPAWN_UNREADABLE)。
+            self._warn(f"spawn {name!r}: could not list panes; nothing was launched")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        panes = existing.get("result", {}).get("panes", [])
+        for pane in panes:
+            if pane.get("label") != _pane_name(name):
+                continue
+            existing_pane_id = pane.get("pane_id") or ""
+            if not existing_pane_id:
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            occupant = self._pane_process_state(existing_pane_id)
+            if occupant != PANE_IDLE:
+                # Live agent in there (or one we cannot see past) → no-op.
+                self.last_spawn_refusal = (
+                    SPAWN_OCCUPIED if occupant == PANE_LIVE
+                    else SPAWN_UNREADABLE)
+                return False
+            # Husk pane: herdr restored the label but not the process.
+            # Relaunching in place keeps the tab (and its position) and is
+            # what makes ./crewvia recover on its own after a server
+            # restart — before this, spawn reported "already exists" and
+            # start.sh went on to launch nothing at all.
+            self._warn(
+                f"spawn {name!r}: pane {existing_pane_id} is an idle shell "
+                "(herdr restart?) — relaunching in place"
+            )
+            if not self._pre_launch_ok(name):
+                return False
+            if _herdr_run("pane_run", [existing_pane_id, cmd], timeout=10) is None:
+                self._warn(f"spawn {name!r}: pane run failed on reused pane")
+                return False
+            if not _wait_until_launched(
+                    lambda: self._pane_process_state(existing_pane_id),
+                    warn=self._warn, name=name):
+                return False
+            self._write_cache(name, pane.get("tab_id") or "", existing_pane_id)
+            return True
 
         # tab create.
         if not self._pre_launch_ok(name):
@@ -6312,8 +6322,16 @@ class HcBackend(_Backend):
                 return False
             want_name = _pane_name(name)
             for t in terminals:
-                labels = t.get("labels") if isinstance(t, dict) else None
-                if isinstance(labels, dict) and labels.get("crewvia_name") == want_name:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("state") == "finished":
+                    continue    # name_taken は live な terminal だけ (§3.0)
+                labels = t.get("labels")
+                t_name = t.get("name")
+                # hc の name_taken と同じ規則: name を小文字化して比べる (ラベルの有無に頼らない)。
+                # crewvia_name ラベルの完全一致も従来どおり占有とみなす。
+                if ((isinstance(t_name, str) and t_name.lower() == hc_name)
+                        or (isinstance(labels, dict) and labels.get("crewvia_name") == want_name)):
                     self.last_spawn_refusal = SPAWN_OCCUPIED
                     return False
         if not self._pre_launch_ok(name):

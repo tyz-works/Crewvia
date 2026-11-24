@@ -354,8 +354,42 @@ def test_hook_does_not_run_when_a_live_terminal_holds_the_name(fake):
     assert b.spawn("Omar-worker", "true") is False
     assert ran == []
     assert b.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
-    assert not any("run" in (c if isinstance(c, list) else c.get("argv", [])) for c in fake.raw_calls()
-                   if isinstance(c, (list, dict)) and "terminal.list" not in json.dumps(c))
+    assert _run_calls(fake) == []
+
+
+def _run_calls(fake):
+    """`hc run` の呼び出し (argv の先頭が run)。空振りしない形: 呼ばれた全 argv の先頭を見る。"""
+    calls = fake.raw_calls()
+    assert calls, "hc が 1 回も呼ばれていない (assert が空振りする)"
+    return [c for c in calls if isinstance(c, list) and c and c[0] == "run"]
+
+
+def _listing_raw(*terminals):
+    return connect_result("terminal.list", {"hidden_finished": 0, "terminals": list(terminals)})
+
+
+def _taken_variants():
+    pn = lib_mux._pane_name("Omar-worker")        # テスト中は接頭辞が付く (CREWVIA_MUX_PANE_PREFIX)
+    return [
+        {"name": pn.lower(), "state": "live"},                                   # ラベル無し
+        {"name": pn.lower(), "labels": {}, "state": "live"},                     # 空のラベル
+        {"name": pn.lower(), "labels": {"crewvia_name": "Other"}, "state": "live"},  # ラベルは別名でも name が衝突
+        {"name": pn.upper(), "labels": None, "state": "live"},                   # 大文字小文字違い (hc は小文字化)
+    ]
+
+
+@pytest.mark.parametrize("terminal", _taken_variants())
+def test_hook_does_not_run_when_hc_would_say_name_taken(fake, terminal):
+    """hc の name_taken (小文字化した name) と同じ照合: ラベルに頼らず terminal の name も見る。"""
+    ran = []
+    fake.set([_status_rule(), _listing_raw(terminal),
+              {"match": ["run"], **ok(out=json.dumps({"address": "t7", "state": "live"}))}])
+    b = backend()
+    b.pre_launch = lambda: ran.append(1) or True
+    assert b.spawn("Omar-worker", "true") is False
+    assert ran == []
+    assert b.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
+    assert _run_calls(fake) == []
 
 
 def test_hook_runs_before_hc_run_when_the_name_is_free(fake):

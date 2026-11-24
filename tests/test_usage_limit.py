@@ -408,6 +408,54 @@ def test_a_corrupt_record_keeps_the_ledger_fp_across_a_second_boundary(r5):
     assert int(r5.entry()["first_seen"]) == int(first_seen)
 
 
+def _unknown_reset_episode(r5, monkeypatch):
+    """時刻不明の枠切れ (促しの時刻が first_seen から決まる = 記録が壊れて作り直されても同じ時刻になる)。
+    促し・再通知の待ちを 0 秒にして、サイクルごとに次の段へ進める。"""
+    monkeypatch.setitem(r5.ns, "USAGE_LIMIT_UNKNOWN_RESUME_AFTER", 0)
+    monkeypatch.setitem(r5.ns, "USAGE_LIMIT_STILL_AFTER", 0)
+    PaneMux.screen = limited_screen("⚠ Usage limit reached")
+    r5.age_state()
+
+
+def _corrupt_and_run(r5):
+    r5.entry_path.write_text("{not json")
+    r5.h.notify_cache.unlink(missing_ok=True)      # 促しのスロットルも失った最悪の形 (TTL が切れた後と同じ)
+    r5.age_state()
+    return r5.run()
+
+
+def test_a_corrupt_record_after_the_still_notice_neither_renudges_nor_renotifies(r5, monkeypatch):
+    """記録が壊れて resumed_at が消えても、同じ episode の促しと「枠切れのまま」は 1 回ずつ。
+    (still の fp が resumed_at の秒を含み、作り直した値で新しい fp になって再通知が出ていた。)"""
+    _unknown_reset_episode(r5, monkeypatch)
+    first = r5.run()
+    assert len(r5.to_worker(first)) == 1                      # 促し
+    again = r5.to_director(r5.run())
+    assert any("再開を促した後も" in m for m in again)        # 「促した後も」の再通知
+    for _ in range(3):
+        sent = _corrupt_and_run(r5)
+        assert r5.to_worker(sent) == [], sent
+        assert r5.to_director(sent) == [], sent
+        time.sleep(1.1)                                       # 秒の境目をまたぐ
+
+
+def test_a_corrupt_record_between_the_nudge_and_the_still_notice(r5, monkeypatch):
+    """促した直後 (まだ still を出していない) に記録が壊れても、促しは繰り返さず still は 1 回だけ。"""
+    _unknown_reset_episode(r5, monkeypatch)
+    monkeypatch.setitem(r5.ns, "USAGE_LIMIT_STILL_AFTER", 3600)
+    assert len(r5.to_worker(r5.run())) == 1                   # 促し (スロットルの記録が残る)
+    r5.entry_path.write_text("{not json")
+    r5.age_state()
+    sent = r5.run()
+    assert r5.to_worker(sent) == [] and r5.to_director(sent) == []
+    monkeypatch.setitem(r5.ns, "USAGE_LIMIT_STILL_AFTER", 0)
+    msgs = r5.to_director(r5.run())
+    assert len([m for m in msgs if "再開を促した後も" in m]) == 1
+    time.sleep(1.1)
+    sent = _corrupt_and_run(r5)
+    assert r5.to_worker(sent) == [] and r5.to_director(sent) == []
+
+
 @pytest.mark.parametrize("tail", ["²", "9" * 400, "-5", "", "nan", "inf", "12.5x", "1700000000", "999999999999", "1999999999"])
 def test_a_garbled_ledger_fp_never_breaks_the_recovery(r5, monkeypatch, tail):
     """台帳の fp の秒が壊れていても (isdigit を通る '²'・inf になる 400 桁・負・空) 例外にならず、

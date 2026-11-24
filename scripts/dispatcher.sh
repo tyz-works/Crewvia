@@ -2183,6 +2183,25 @@ def _first_seen_from_ledger(key: str, notice: str, now: float) -> Optional[float
     return seen
 
 
+def _resumed_at_after_corrupt_record(name: str, ident: str, first_seen: float, now: float) -> Optional[float]:
+    """壊れた記録で失われた `resumed_at` を、記録の外の証拠から引き継ぐ (同じ episode のときだけ)。
+
+    証拠は 2 つ: (a) 「促しの後も枠切れ」の台帳キーが今の episode (`ident`) の fp を持つ = 促しは済んでいる
+    (時刻は不明なので first_seen を置く。still の通知は台帳が止める)、(b) 促しのスロットル
+    (`usage_limit_resume_<name>` の送信時刻) が今の episode の中 (first_seen 以降・未来でない) にある。
+    どちらも無ければ None (= 促しはまだ)。引き継ぐ値は有限・0 以上・未来でない。"""
+    told = load_told()
+    if not is_unreadable(told):
+        entry = told.get(f'usage-limit-still_{name}')
+        if isinstance(entry, dict) and entry.get('fp') == ident:
+            return float(first_seen)
+    sent = load_notify_cache().get(f'usage_limit_resume_{name}')
+    if (isinstance(sent, (int, float)) and not isinstance(sent, bool) and math.isfinite(sent)
+            and 0 <= sent <= now + 60 and sent >= first_seen):
+        return float(sent)
+    return None
+
+
 def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     """利用枠切れの Worker を Rule 5 の代わりに扱う。True = Rule 5 は黙る (この関数が扱った)。
 
@@ -2202,7 +2221,8 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     entry = lib_usage_limit.observe(prev, screen, now)
     key = f'usage-limit_{name}'
     still_key = f'usage-limit-still_{name}'
-    if entry is not None and prev is None and _usage_limit_record_is_corrupt(name):
+    record_was_corrupt = entry is not None and prev is None and _usage_limit_record_is_corrupt(name)
+    if record_was_corrupt:
         # 記録が壊れた (欠けたのではない)。first_seen を作り直すと台帳の fp (`…@<秒>`) が
         # 秒の境目をまたいで変わり、同じ通知がもう 1 回出る。台帳が同じ通知行の fp を持つなら
         # その見え始めを引き継ぐ (免除の上限の起点も延びない)。
@@ -2222,6 +2242,10 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     # 台帳の fp は通知行 + 見え始め: 同じ通知行 (相対時刻など) の次の利用枠切れは別の fp になり、
     # 前回の台帳キーが消し損ねで残っていても最初の通知が出る (t018 / P2)。
     ident = f'{lib_usage_limit.identity(entry["notice"])}@{int(entry["first_seen"])}'
+    if record_was_corrupt and entry['resumed_at'] is None:
+        # 記録が壊れて resumed_at が消えた。新しい値で fp を作ると、再開の促しと「枠切れのまま」の
+        # 再通知が同じ episode でもう 1 回ずつ出る。記録の外の証拠から引き継ぐ (first_seen と同じ考え方)。
+        entry['resumed_at'] = _resumed_at_after_corrupt_record(name, ident, entry['first_seen'], now)
 
     # 記録を保てない (書けない) なら上限つきのタイマーを維持できない → 通常の Rule 5 に戻す
     # (t018 / P2)。上限超えの場合も、同じ通知行の間は同じ first_seen を保たせるため保存する。
@@ -2270,7 +2294,7 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     elif (entry['resumed_at'] is not None
           and now >= entry['resumed_at'] + USAGE_LIMIT_STILL_AFTER):
         notify_state_once(
-            still_key, f'{ident}@{int(entry["resumed_at"])}', 'usage-limit', '_daemon', name,
+            still_key, ident, 'usage-limit', '_daemon', name,
             lambda: (f'[Rule 5] Worker {name} は再開を促した後も利用枠切れのままです '
                      f'(リセット予定 {reset_txt}, task {task_id}, mission={slug})。'
                      f'枠がまだ戻っていない可能性があります。表示: {entry["notice"][:120]}'),

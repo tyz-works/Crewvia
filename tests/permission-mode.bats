@@ -17,6 +17,9 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 START_SH="${REPO_ROOT}/scripts/start.sh"
+source "$(dirname "$BATS_TEST_FILENAME")/bats_sandbox.sh"   # t006: 実 checkout の registry/ を書かない隔離
+setup() { bats_sandbox_create; }
+
 
 # ---------------------------------------------------------------------------
 # Worker: デフォルトは auto
@@ -118,6 +121,7 @@ teardown() {
         find "$FAKE_TMUX_DIR" -mindepth 1 -delete 2>/dev/null || true
         rmdir "$FAKE_TMUX_DIR" 2>/dev/null || true
     fi
+    bats_sandbox_destroy
 }
 
 @test "worker (mux mode): 起動コマンド文字列に --permission-mode auto が含まれる" {

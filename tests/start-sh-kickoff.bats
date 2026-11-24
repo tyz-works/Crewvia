@@ -18,6 +18,9 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 START_SH="${REPO_ROOT}/scripts/start.sh"
+source "$(dirname "$BATS_TEST_FILENAME")/bats_sandbox.sh"   # t006: 実 checkout の registry/ を書かない隔離
+setup() { bats_sandbox_create; }
+
 source "$(dirname "$BATS_TEST_FILENAME")/trust_fixture.sh"   # t021: start.sh の trust 事前検査を通す偽の設定
 
 # capture-pane の応答を $FAKE_TMUX_SCREEN の内容に固定した fake tmux を用意する。
@@ -86,6 +89,7 @@ teardown() {
     # start.sh writes the worker system prompt into WORK_DIR/.claude/settings.local.json
     # (gitignored) since CREWVIA_BENCH_MODE is unset for these tests — clean it up.
     rm -f "${REPO_ROOT}/.claude/settings.local.json"
+    bats_sandbox_destroy
 }
 
 @test "kickoff lands on the first attempt: exactly one send, no retry, success logged" {

@@ -21,6 +21,9 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 LIB_MUX_PY="${REPO_ROOT}/scripts/lib_mux.py"
+source "$(dirname "$BATS_TEST_FILENAME")/bats_sandbox.sh"   # t006: 実 checkout の registry/ を書かない隔離
+setup() { bats_sandbox_create light; }
+
 # scripts/ の隔離コピーを作る共通 helper (copy_scripts_libs / copy_plan_tree)
 source "${REPO_ROOT}/tests/fixture_tree.sh"
 
@@ -156,6 +159,7 @@ teardown() {
         find "$dir" -mindepth 1 -delete 2>/dev/null || true
         rmdir "$dir" 2>/dev/null || true
     done
+    bats_sandbox_destroy
 }
 
 # Assert the call log contains a string.

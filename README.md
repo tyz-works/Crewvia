@@ -309,7 +309,7 @@ The mapping is defined in `config/crewvia.yaml` under `model_per_skill`:
 
 | Skill | Default model | Rationale |
 |---|---|---|
-| `planning`, `plan_review`, `review`, `research` | `opus` | Deep reasoning reduces errors |
+| `planning`, `plan_review`, `review`, `research`, `design` | `opus` | Deep reasoning reduces errors |
 | `docs`, `qa`, `verify` | `sonnet` | Haiku ignores `--permission-mode auto` and stalls on approval dialogs |
 | `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `sonnet` | worker_model fallback (not in model_per_skill) |
 
@@ -871,6 +871,7 @@ the Americas, Africa, and Slavic regions — 50 names by default.
 | `database` | DB operations, queries |
 | `cloud` | Cloud platforms (AWS, OCI, GCP) |
 | `docs` | Documentation writing |
+| `design` | Writes design documents (`knowledge/*.md`) and opens them as a PR. Same permissions as `docs`; model `opus` |
 | `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked (`plan.sh done <id> "<result>" --pr <N>` on the PR-producing task sets it for you). Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md`. A diff over 300KB is refused (fail-closed) and the refusal is recorded, so the Dispatcher does not respawn the review — switch to a manual diff review, or split the PR and `plan.sh update <id> --pr-number <new PR>` |
 
 ---

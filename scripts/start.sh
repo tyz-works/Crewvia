@@ -114,14 +114,47 @@ _resolve_worker_model() {
   printf '%s' "${result}"
 }
 
+# --- 束ねた起動: CREWVIA_BIND_TASK=<slug>/<tid> (モデルの段上げ PR-2。設計 knowledge/model-escalation.md §4.3-3・§4.5) ---
+# 段上げした task 専用の Worker を起動する。モデルは card から `plan.sh model-for` で取る (**1 か所**。値の検査 =
+# check_mission_slug / check_task_id も plan.sh 側。start.sh は値を渡すだけ)。決められない (値が壊れている・card が無い・
+# model_override が壊れている・exit 1) ときは **起動しない** — 束ねの無い Worker が普通に task を取るより安全。
+# dry-run (CREWVIA_PRINT_MODEL=1) と実際の起動の両方が、ここで決めた BIND_MODEL を使う。
+BIND_TASK=""
+BIND_MODEL=""
+BIND_ERR=""
+BIND_PULL_FLAGS=""
+if [[ -n "${CREWVIA_BIND_TASK:-}" ]]; then
+  BIND_TASK="${CREWVIA_BIND_TASK}"
+  if [[ "${ROLE}" != "worker" ]]; then
+    BIND_ERR="CREWVIA_BIND_TASK は worker の起動にだけ使えます (role: ${ROLE})"
+  elif [[ "$BIND_TASK" != */* || "${BIND_TASK#*/}" == */* || "${BIND_TASK%%/*}" == "" || "${BIND_TASK#*/}" == "" ]]; then
+    BIND_ERR="CREWVIA_BIND_TASK は <mission_slug>/<task_id> の形です"
+  else
+    _BIND_SLUG="${BIND_TASK%%/*}"
+    _BIND_TID="${BIND_TASK#*/}"
+    if BIND_MODEL="$(bash "${SCRIPT_DIR}/plan.sh" model-for "$_BIND_TID" --mission "$_BIND_SLUG" 2>/dev/null)" && [[ -n "$BIND_MODEL" ]]; then
+      BIND_PULL_FLAGS="--task ${_BIND_TID} --mission ${_BIND_SLUG} "
+    else
+      BIND_MODEL=""
+      BIND_ERR="plan.sh model-for が ${BIND_TASK} の実効モデルを決められませんでした (値の形・card の有無・model_override・config を確認: bash scripts/plan.sh model-for <tid> --mission <slug>)"
+    fi
+  fi
+fi
+
 # --- dry-run モード: CREWVIA_PRINT_MODEL=1 ---
 # AGENT_NAME 割り当て・registry 書き込みなど副作用のある処理より前に exit する。
 # QA が何度実行しても registry / worktree を汚さない。
 if [[ "${CREWVIA_PRINT_MODEL:-0}" == "1" ]]; then
+  if [[ -n "$BIND_ERR" ]]; then
+    echo "[crewvia] ERROR: $BIND_ERR" >&2
+    exit 1
+  fi
   if [[ "${ROLE}" == "director" ]]; then
     echo "${CREWVIA_DIRECTOR_MODEL:-}"
   elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
     echo "${CREWVIA_WORKER_MODEL:-}"
+  elif [[ -n "$BIND_MODEL" ]]; then
+    echo "$BIND_MODEL"
   else
     _SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
     echo "$(_resolve_worker_model "${_SKILLS_CSV}")"
@@ -653,11 +686,30 @@ fi
 #   1. CREWVIA_WORKER_MODEL が起動前から明示的に設定されていた (WORKER_MODEL_EXPLICIT=1) → 最優先
 #   2. それ以外 → _resolve_worker_model() で skill に応じたモデルを解決 (model_per_skill 適用)
 #   3. resolver が空を返した → --model を付けない (claude CLI のデフォルトに委ねる)
+if [[ -n "$BIND_ERR" ]]; then
+  # 束ねた起動で実効モデルを決められない → 起動しない (副作用より前。refusals.log にも残す)
+  echo "[crewvia] ERROR: $BIND_ERR" >&2
+  _log_refusal bind-task "$BIND_ERR"
+  exit 1
+fi
 if [[ "${ROLE}" == "director" ]]; then
   SELECTED_MODEL="${CREWVIA_DIRECTOR_MODEL:-}"
 elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
   # ユーザーが env var で明示指定 → skill mapping を使わず env var を尊重
   SELECTED_MODEL="${CREWVIA_WORKER_MODEL:-}"
+  # 束ねた起動で、明示 env が card の実効モデルより低い: 人の明示が勝つが 1 行警告する (§4.5)。
+  if [[ -n "$BIND_MODEL" ]] && python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import lib_model as m
+env, card = m.alias_of(sys.argv[2]), m.alias_of(sys.argv[3])
+sys.exit(0 if env is not None and card is not None and m.ESCALATION_LADDER.index(env) < m.ESCALATION_LADDER.index(card) else 1)
+' "$SCRIPT_DIR" "$SELECTED_MODEL" "$BIND_MODEL"; then
+    echo "[crewvia] WARNING: CREWVIA_WORKER_MODEL=${SELECTED_MODEL} は ${BIND_TASK} の実効モデル ${BIND_MODEL} より低いですが、明示の env を優先します" >&2
+  fi
+elif [[ -n "$BIND_MODEL" ]]; then
+  # 束ねた起動: card の実効モデル (model_override があればそれ・無ければ skills の既定)
+  SELECTED_MODEL="$BIND_MODEL"
 else
   # skill に応じてモデルを自動選択 (_resolve_worker_model は dry-run と同じ helper を使う)
   SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
@@ -667,6 +719,8 @@ fi
 # env = 人が起動前に CREWVIA_WORKER_MODEL を明示 / skill = model_per_skill か worker_model / none = 解決が空
 if [[ "${ROLE}" == "worker" && "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
   SELECTED_MODEL_SOURCE="env"
+elif [[ -n "$BIND_MODEL" ]]; then
+  SELECTED_MODEL_SOURCE="override"
 elif [[ -n "$SELECTED_MODEL" ]]; then
   SELECTED_MODEL_SOURCE="skill"
 else
@@ -679,7 +733,7 @@ fi
 # 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
 _record_worker_model() {
   python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
-    "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" >/dev/null \
+    "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" "$BIND_TASK" >/dev/null \
     || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
 }
 
@@ -1010,9 +1064,9 @@ PYEOF
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
       if [[ -n "${TARGET_DIR:-}" ]]; then
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull ${BIND_PULL_FLAGS}--agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       else
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull ${BIND_PULL_FLAGS}--agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       fi
     else
       KICKOFF_MSG="ミッション開始。plan status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"

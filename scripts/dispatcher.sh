@@ -287,6 +287,8 @@ import lib_usage_limit  # noqa: E402
 # 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
 # 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
 import lib_worker_target as _worker_target  # noqa: E402
+import lib_worker_model as _worker_model  # noqa: E402
+import lib_model as _lib_model  # noqa: E402
 # 割り当て文に貼る Worker 名の検証 (plan.sh pull --agent が受け付ける形と同じ定義。コピーしない)。
 from lib_agent_name import shell_pasteable_agent_name_problem as _shell_pasteable_problem  # noqa: E402
 # 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
@@ -978,10 +980,38 @@ def worker_target_record(agent_name):
     return _target_record_memo[agent_name]
 
 
-def worker_may_take_task(agent_name, meta):
-    """この Worker に task (`meta`) を割り当ててよいか — `(可否, 理由)`。判定は lib 1 つ。"""
-    return _worker_target.worker_may_take(
+_model_record_memo = {}       # dispatch() が毎サイクルの先頭で空にする
+
+
+def worker_model_record(agent_name):
+    """`registry/workers/<agent>/model.json` (検証済みの dict か `Unreadable`。無いは `is_missing`)。
+
+    1 サイクルに 1 度だけ読む。読めない (missing でない) は通知スロットルに 1 回だけ警告 (TARGET_DIR の記録と同じ作法)。
+    """
+    if agent_name not in _model_record_memo:
+        def _warn(msg, agent_name=agent_name):
+            key = f"model_record_trouble_{agent_name}"
+            if should_notify(key):
+                log(f"WARNING: {agent_name}: {msg}")
+                record_notify(key)
+        _model_record_memo[agent_name] = _worker_model.load_record(
+            REGISTRY_DIR, agent_name, warn=_warn)
+    return _model_record_memo[agent_name]
+
+
+def worker_may_take_task(agent_name, meta, slug=None):
+    """この Worker に task (`meta`・mission `slug`) を割り当ててよいか — `(可否, 理由)`。**1 か所の AND**。
+
+    TARGET_DIR の判定 (`lib_worker_target`) → モデルの束ねの判定 (`lib_worker_model`) の順。理由は**最初に断った方の 1 つだけ**
+    (TARGET_DIR が合わない Worker に「モデルが違う」と出さない。設計 §4.7)。割り当て・退役の takeable_pending・no_worker の
+    3 か所がここを通る (plan.sh pull は同じ 2 つの lib を同じ順で使う)。`slug` が無ければ meta の mission を指せないので
+    モデルの判定は束ねの照合に使えない (呼び出し側は必ず渡す)。
+    """
+    ok, why = _worker_target.worker_may_take(
         worker_target_record(agent_name), meta.get('target_dir'))
+    if not ok:
+        return ok, why
+    return _worker_model.worker_may_take(worker_model_record(agent_name), meta, slug)
 
 
 def worker_outstanding_assignment(agent_name, all_tasks):
@@ -1006,12 +1036,15 @@ def worker_outstanding_assignment(agent_name, all_tasks):
     return None
 
 
-def worker_start_command(task_skills, target_dir, *, fresh):
+def worker_start_command(task_skills, target_dir, *, fresh, exclude=(), bind_task=None):
     """Director がそのまま貼れる Worker 起動コマンド (`director.md` の起動手順と同じ形)。
 
     `fresh`: 同じ skill の Worker が (別の TARGET_DIR で) 生きているとき。registry-first の
     名前引きは同じ名前を返し、`start.sh` は「既に居る」で断るので、新しい名前を取らせる。
     名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
+    `exclude`: 同じ skills で生きている Worker の名前。`--fresh` だけだとプール枯渇で空になりうるので並べる
+    (memory parallel-same-skill-worker-needs-exclude)。`bind_task` (`<slug>/<tid>`): 段上げした task 専用の
+    Worker にする (`CREWVIA_BIND_TASK`。モデルは start.sh が card から取る — `CREWVIA_WORKER_MODEL` は付けない。設計 §4.3)。
     """
     skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
     # 既定は『選ばれている backend』(env > config > auto)。リテラルの herdr だと、
@@ -1026,10 +1059,12 @@ def worker_start_command(task_skills, target_dir, *, fresh):
         except Exception:
             backend = 'herdr'
     target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
+    bind = f"CREWVIA_BIND_TASK={shlex.quote(bind_task)} " if bind_task else ''
+    excl = f" --exclude {shlex.quote(','.join(exclude))}" if fresh and exclude else ''
     return (
         f"cd {shlex.quote(str(REPO_ROOT))} && "
-        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{' --fresh' if fresh else ''}) "
-        f"{target}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
+        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{' --fresh' if fresh else ''}{excl}) "
+        f"{target}{bind}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
         f"bash scripts/start.sh worker {skills}"
     )
 
@@ -2701,6 +2736,7 @@ def effective_config_readable():
 def dispatch():
     _director_live_memo.clear()
     _target_record_memo.clear()
+    _model_record_memo.clear()
     if not effective_config_readable():
         return
     state = load_state()
@@ -2966,7 +3002,7 @@ def dispatch():
                 # task は回さない (別 repo 用の Worker に crewvia 本体の task が回り、
                 # 差し戻しても同じ Worker に再割り当てされた)。記録が読めない Worker には
                 # target_dir 付きの task を回さない (保留)。判定は lib_worker_target 1 つ。
-                may_take, why_not = worker_may_take_task(agent_name, meta)
+                may_take, why_not = worker_may_take_task(agent_name, meta, slug)
                 if not may_take:
                     _tkey = f"target_skip_{agent_name}_{slug}_{meta['id']}"
                     if should_notify(_tkey):
@@ -3021,17 +3057,32 @@ def dispatch():
             # 自分の TARGET_DIR の task を待つ Worker は takeable_pending が空でないので、
             # この分岐に来ず Rule 2 のまま (#21 が守ろうとした挙動は変わらない)。
             takeable_pending = [(sl, m) for sl, m in matching_pending
-                                if worker_may_take_task(agent_name, m)[0]]
+                                if worker_may_take_task(agent_name, m, sl)[0]]
             # 例外: Worker の TARGET_DIR の記録が「無い / 読めない」ときは、target_dir 付きの
             # task を取れないのは記録が無いからで、task が合わないと確定していない
             # (PR3 より前に起動した Worker は自分の task を待っているだけかもしれない)。
             # 観測できなかったものを根拠に破壊 (退役) しない — 従来どおり待機に倒す。
-            _rec_known = not is_unreadable(worker_target_record(agent_name))
+            #
+            # モデルの記録 (model.json) も同じ向き (段上げ PR-2・設計 §4.3 の 5): **無い** (is_missing = PR-1 より前に
+            # 起動した Worker) は「override の task を永久に取れない」と確定しているので退役でよい。**読めない**
+            # (missing でない) は束ねられているかも分からない = 取れないと確定していないので待機。is_missing を先に見る
+            # (load_json_store は「無い」も Unreadable)。2 つの記録の判定をこの 1 つの式に置く (分岐を増やさない)。
+            _target_known = not is_unreadable(worker_target_record(agent_name))
+            _model_rec = worker_model_record(agent_name)
+            _model_known = is_missing(_model_rec) or not is_unreadable(_model_rec)
+            _rec_known = _target_known and _model_known
             if has_any and not takeable_pending and not has_in_progress and not _rec_known:
-                _skey = f"target_only_{agent_name}"
+                # 原因で文面とキーを分ける (どの記録のせいで待っているかをログから読めるように)。
+                if not _target_known:
+                    _skey = f"target_only_{agent_name}"
+                    _smsg = (f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけだが、"
+                             f"TARGET_DIR の記録が無い/読めないため合わないと確定できない — 退役させず待機")
+                else:
+                    _skey = f"model_rec_unknown_{agent_name}"
+                    _smsg = (f"[model] {agent_name}: 残っている task はあるが取れるものが無く、モデルの記録 "
+                             f"(model.json) が読めないため束ねられているか確定できない — 退役させず待機")
                 if should_notify(_skey):
-                    log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけだが、"
-                        f"TARGET_DIR の記録が無い/読めないため合わないと確定できない — 退役させず待機")
+                    log(_smsg)
                     record_notify(_skey)
             elif not takeable_pending and not has_in_progress:
                 # 残っている task が無い (not has_any) か、あっても TARGET_DIR が合わず
@@ -3138,6 +3189,20 @@ def dispatch():
         if task_skills & CODEX_REVIEW_SKILLS:
             handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission)
             continue
+        # 段上げの印 (model_override) が壊れた task は割り当てない (§4.8)。既定モデルに黙って倒すと、上げたはずの task が
+        # 安いモデルで走る。Director に 1 回だけ (状態ベース。直せば台帳から捨てられる)。no_worker の通知は重ねない。
+        _ov, _ov_problem = _worker_model.override_of(meta)
+        if _ov_problem:
+            _okey = f'model-override-invalid-{slug}-{task_id}'
+            live_state_keys.add(_okey)
+            _ofp = fingerprint('model_override_invalid', repr(meta.get('model_override')))
+            def _omsg(_t=task_id, _s=slug):
+                return (f"[model-override-invalid] task {_t} (mission={_s}): card の model_override が別名 "
+                        f"({'/'.join(_lib_model.ESCALATION_LADDER)}) ではないため割り当てを保留しています。"
+                        f"直す: plan.sh update {_t} --model-override <別名>|none --mission {_s}")
+            notify_state_once(_okey, _ofp, 'model-override-invalid', slug, task_id, _omsg,
+                              director_live=director_live_for_state_notices)
+            continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
         # #21: skill に加えて TARGET_DIR の記録も合う Worker だけが「担当できる」。
         skill_ok = [
@@ -3145,7 +3210,7 @@ def dispatch():
             if (workers.get(name) or {}).get('role', 'worker') == 'worker'
             and task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
         ]
-        can_handle = any(worker_may_take_task(name, meta)[0] for name in skill_ok)
+        can_handle = any(worker_may_take_task(name, meta, slug)[0] for name in skill_ok)
         if not can_handle:
             # Include slug to avoid collision when missions reuse t001, t002, etc.
             notify_key = f"no_worker_{slug}_{task_id}"
@@ -3155,11 +3220,21 @@ def dispatch():
                     f"(task {task_id}, mission={slug})"
                 )
                 if skill_ok:
-                    # skill は合う Worker が居るのに担当できない = TARGET_DIR が合わない。
-                    msg += f" — 既存の Worker は担当できません: {worker_may_take_task(skill_ok[0], meta)[1]}"
+                    # skill は合う Worker が居るのに担当できない = TARGET_DIR かモデルの束ねが合わない (理由は最初に断った 1 つ)。
+                    msg += f" — 既存の Worker は担当できません: {worker_may_take_task(skill_ok[0], meta, slug)[1]}"
+                bind = None
+                if _ov is not None:
+                    # 段上げ済みの task: モデルを案内し、その task 専用 (束ねた) Worker の起動コマンドを渡す (§4.3・§4.7)。
+                    bind = f"{slug}/{task_id}"
+                    try:
+                        _base = _lib_model.resolve(str(REPO_ROOT / 'config' / 'crewvia.yaml'), ','.join(sorted(task_skills)))
+                    except Exception:  # noqa: BLE001 — 通知の飾りで止めない
+                        _base = ''
+                    msg += f" — モデル: {_base or '既定'} → {_ov}（段上げ）"
                 msg += (
                     f"。起動コマンド: "
-                    + worker_start_command(task_skills, meta.get('target_dir'), fresh=bool(skill_ok))
+                    + worker_start_command(task_skills, meta.get('target_dir'), fresh=bool(skill_ok),
+                                           exclude=sorted(skill_ok), bind_task=bind)
                 )
                 if tmux_send(_director_name(), msg):
                     record_notify(notify_key)

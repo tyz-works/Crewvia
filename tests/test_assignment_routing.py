@@ -842,7 +842,7 @@ class TestDispatcherRouting:
         msg = msgs[0]
         assert f"TARGET_DIR={OTHER_REPO}" in msg
         assert "CREWVIA_MUX_ENABLED=1" in msg and "CREWVIA_MUX=" in msg
-        assert "AGENT_NAME=$(bash scripts/assign-name.sh code --fresh)" in msg, (
+        assert f"AGENT_NAME=$(bash scripts/assign-name.sh code --fresh --exclude {AGENT})" in msg, (
             "同じ skill の Worker が (別 TARGET_DIR で) 居るので新しい名前を取らせる")
         assert "bash scripts/start.sh worker code" in msg
         assert "担当できません" in msg

@@ -1,6 +1,6 @@
 # モデルの段上げ（品質不足で差し戻した task を 1 段上のモデルで走らせる）— 設計
 
-作成日: 2026-11-24。状態: 設計。**PR-1（記録）は実装済み**（mission `20261124-model-escalation-impl` t001。§7・§12 に実装メモ）。PR-2 / PR-3 は未実装。mission `20261124-model-escalation-design` t001。
+作成日: 2026-11-24。状態: 設計。**PR-1（記録）・PR-2（欄と束ね）は実装済み**（mission `20261124-model-escalation-impl` t001・t004。§12 に実装メモ）。PR-3 は未実装。mission `20261124-model-escalation-design` t001。
 
 - 根拠のコードは **main `e3b2951`**（#433）の行番号。`scripts/plan.sh:N` のように書く。確かめていないことは「未確認」と書く。
 - 前提: モデル指定を版なしの別名（`opus` / `sonnet` / `haiku`）だけにする mission `20261124-model-alias-only` が進行中（この文書を書いた時点で t001 実装中・未 merge）。**実装 PR はその merge 後の main に載せる**。codex-review はこのマシンの local（`config/crewvia.local.yaml`）で `haiku`。
@@ -373,6 +373,11 @@ PR-1 と PR-2 は独立に revert できる。PR-3 は PR-2 の上でだけ意�
 - **PR-1 実装メモ（2026-11-24）**: `plan.sh` の `lib_task_cards` は `_load_scripts_module` で別に読み込まれ、`lib_worker_model` が import する `lib_task_cards` とは**別のモジュール**。呼び出し側が `is_missing()` / `is_unreadable()` を取り違える（isinstance が偽になり `rec['model']` が TypeError）ので、「無い / 読めない / 値」の判定は `lib_worker_model.recorded_model()` に閉じた。PR-2 の `worker_may_take` も plan.sh から呼ぶなら同じ形（判定を lib の中で済ませる）にする。
 - PR-1 の限界: Worker が消えても `model.json` は掃除しない（`lib_worker_target.sweep_stale_records` は `target_dir.json` だけ見る）。後任の `start.sh` が置き換えるので害は無いが、記録の書き込みに失敗した後任には先任の記録が残りうる。PR-2 で `worker_may_take` が読むようになる前に、掃除に `model.json` を含めるか決める。
 
+- **PR-2 実装メモ（2026-11-24）**:
+  - pull の `--task` の照合は、設計では「`lib_worker_target.worker_may_take` と AND」と書いたが、実際の pull は target_dir を**インラインで比べている**（`lib_worker_target` を呼ばない）。モデルの判定はその直後に足した（`lib_worker_model.worker_may_take_for`。拒否は exit 3・何も書かない）。
+  - 宙に浮いた symlink の `model.json` は `ENOENT` = 「無い」になる（共通の読み口の挙動。target_dir.json と同じ）。実在するファイルへの symlink は中身を読む。
+  - PR-1 レビュー（#435 の Seo）の P3 2 件: (a) 退役の表は「task は残っているが `takeable_pending` が空」の意味（`has_any` が偽なら今どおり退役）、(b) 待機のログは原因で文面とキーを分ける（`target_only_<Name>` / `model_rec_unknown_<Name>`）を実装した。
+  - **掃除は未決のまま**: Worker が消えても `model.json` は掃除しない（先任の記録が、記録の書き込みに失敗した後任に残りうる）。PR-2 では `bound_task` を持つ記録が残っても、その task が終われば束ねた Worker は退役するので害は小さいと見て入れていない（`sweep_stale_records` を `model.json` に広げるかは PR-3 の前に決める）。
 - Worker のセッションの中で人が `/model` を切り替えた分は記録に入らない（§4.2）。transcript から読む案はあるが、v1 ではやらない。
 - 別名（`opus`）が指す版は CLI の既定で決まるので、台帳の `model: opus` は「その時点の opus」。版まで残したいなら Worker の会話記録の `message.model` を読む必要がある（未確認・v1 ではやらない）。
 - WIP を機械で数えていないので、段上げの Worker が増えても dispatcher は止めない（§4.3）。運用で困ったら別途。

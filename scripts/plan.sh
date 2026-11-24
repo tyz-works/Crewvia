@@ -136,7 +136,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr|ci-gate> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr|ci-gate|model-for> [args...]" >&2
   exit 1
 fi
 
@@ -490,6 +490,8 @@ _HISTORY = _import_scripts_module('lib_history')
 # Worker が起動されたときのモデルの記録 (registry/workers/<Name>/model.json) は lib_worker_model.py の 1 か所
 # (モデルの段上げ PR-1・knowledge/model-escalation.md §4.2)。plan.sh の pull が読むだけで、書くのは start.sh。
 _WORKER_MODEL = _import_scripts_module('lib_worker_model')
+# モデルの別名の段 (ESCALATION_LADDER) と実効モデル (effective_model) も lib_model.py の 1 か所 (PR-2・設計 §5)。
+_MODEL = _import_scripts_module('lib_model')
 # 共通 config/crewvia.yaml + マシン固有の config/crewvia.local.yaml を重ねて読むのは lib_config.py の 1 か所
 # (knowledge/machine-local-config.md)。config を読む subcommand は壊れた local を拒否する (UsageExit・何も書かない)。
 _CONFIG = _import_scripts_module('lib_config')
@@ -1043,6 +1045,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
     'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr', 'ci-gate',
+    'model-for',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2742,7 +2745,7 @@ USAGE = {
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
                '                       [--description <text>] [--reset] [--pr-number <N>] [--pr-repo <owner/name|null>]\n'
                '                       [--deliverable pr|file|none] [--blocked-reason "<理由>"]\n'
-               '                       [--idle-timeout <s>] [--max-timeout <s>]\n'
+               '                       [--idle-timeout <s>] [--max-timeout <s>] [--model-override haiku|sonnet|opus|none]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
     'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>]\n'
@@ -2772,6 +2775,7 @@ USAGE = {
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
     'resolve-pr': 'plan.sh resolve-pr <pr_number> [--target-dir <dir>]',
     'ci-gate': 'plan.sh ci-gate <pr_number> [--target-dir <dir> | --repo <owner/name>]',
+    'model-for': 'plan.sh model-for <task_id> --mission <slug>',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -2786,7 +2790,7 @@ POSITIONAL_ARITY = {
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'history': (1, 1), 'pr-base': (0, 0),
-    'resolve-pr': (1, 1), 'ci-gate': (1, 1),
+    'resolve-pr': (1, 1), 'ci-gate': (1, 1), 'model-for': (1, 1),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -2798,7 +2802,7 @@ PULL_USAGE_EXIT = 1
 #: 使い方の誤りを exit 1 で返すサブコマンド。`pull` は 2 = idle のため。`pr-base` は呼び出し元が
 #: `PR_BASE="$(plan pr-base)" || exit 1` と書き、「決められない」は全部 exit 1 (exit 2 は idle の意味。
 #: knowledge/git-policy.md §3)。
-PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base', 'resolve-pr', 'ci-gate')
+PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base', 'resolve-pr', 'ci-gate', 'model-for')
 
 
 class UsageExit(SystemExit):
@@ -3520,6 +3524,39 @@ def cmd_pr_base(args):
     print(f"{_GIT_POLICY.REMOTE}/{value}" if opts.get('--diff-ref') else value)
 
 
+def cmd_model_for(args):
+    """task の**実効モデル** (`model_override` があればそれ、無ければ skills の既定) を 1 行出す。読み取り専用
+    (ロックも取らない・queue を書かない)。start.sh の束ねた起動 (`CREWVIA_BIND_TASK`) が使う (設計 §4.3-3・§5)。
+
+    **決められなければ exit 1・stdout 空** (既定に倒さない): mission / task の識別子が使えない・card が無い・読めない・
+    `model_override` が別名でない・既定モデルが空 (CLI の既定) / config が読めない。識別子は `pr-base` と同じく
+    パスにする前に `check_mission_slug` / `check_task_id` で検査する。"""
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    if '--mission' not in opts:
+        die("model-for: --mission <slug> が必要です", 1)
+    slug, task_id = opts['--mission'], positional[0]
+    try:
+        _GIT_POLICY.check_mission_slug(slug)
+        _GIT_POLICY.check_task_id(task_id)
+    except _GIT_POLICY.GitPolicyError as e:
+        die(f"model-for: 識別子が使えません: {_GIT_POLICY.format_policy_error(e)}")
+    if not os.path.isdir(mission_dir(slug)):
+        die(f"model-for: mission '{slug}' が active な mission に無い")
+    if not os.path.exists(task_path(slug, task_id)):
+        die(f"model-for: task '{task_id}' が mission '{slug}' に無い")
+    meta, _body = load_task(slug, task_id)
+    override, problem = _WORKER_MODEL.override_of(meta)
+    if problem:
+        die(f"model-for: {slug}/{task_id}: {problem}")
+    cfg = _CONFIG.load_effective(REPO_ROOT)
+    if _TASK_CARDS.is_unreadable(cfg):
+        die(f"model-for: config を読めません: {cfg.reason}")
+    model = _MODEL.effective_model(os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'), meta.get('skills') or [], override)
+    if not model:
+        die(f"model-for: {slug}/{task_id} の実効モデルを決められません (既定モデルが空)")
+    print(model)
+
+
 def cmd_resolve_pr(args):
     """PR 番号から、その PR を作った task を `<mission_slug>/<task_id>` で 1 行だけ出す (読み取り専用。
     ロックも取らない・queue を書かない)。
@@ -3751,7 +3788,7 @@ _INTENT_FREEZE = {
     # 読み取り専用 (queue の card を書かない)
     'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
     'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'resolve-pr': 'allow', 'ci-gate': 'allow',
-    'task-graph': 'allow', 'resync': 'allow',
+    'task-graph': 'allow', 'resync': 'allow', 'model-for': 'allow',
     # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
     # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
     # init は `--force` で既存の mission を退避する = 本体の中で `_die_if_intent_stuck_before_move` が止める (他の形は新しい slug を作るだけ)。
@@ -3991,7 +4028,7 @@ def classify_assignment_for_execution(agent, mission, task_id, execution_id):
 def _pull_result(slug, meta, body):
     """pull が stdout に出す JSON の元 (今までの欄。`task_slug` / `worktree_path` / `execution_id` / `attempt` は後で足す)。"""
     desc, _result = parse_task_body(body)
-    return {
+    out = {
         'mission': slug,
         'id': meta['id'],
         'title': meta['title'],
@@ -4004,6 +4041,10 @@ def _pull_result(slug, meta, body):
         'reopen_count': meta.get('reopen_count') or 0,
         'pr_number': meta.get('pr_number') or None,
     }
+    # 段上げの印 (別名のときだけ。欄の無い card は今までと同じ JSON。壊れた値は pull 自体が断るのでここには来ない)
+    if _MODEL.is_alias(meta.get('model_override')):
+        out['model_override'] = meta['model_override']
+    return out
 
 
 def _pull_worker_model(agent):
@@ -4277,6 +4318,7 @@ def cmd_pull(args):
         held_tasks = []   # [(slug, task_id, [failed dep ids])] — Director の判断待ち。
                           # slug を持つのは、別 mission に同じ tNNN があるため (解除の案内に要る)
         target_mismatch = 0
+        model_mismatch = 0
         missing_dirs = []
 
         candidates = []
@@ -4327,6 +4369,17 @@ def cmd_pull(args):
                             f"この Worker の TARGET_DIR は {effective_target or '(crewvia 本体)'} です。"
                             f"取りません (何も書いていません)。"
                             f"Director は target_dir に合う Worker を起動して割り当ててください。",
+                            PRECONDITION_UNMET,
+                        )
+                    # (1b) モデルの束ね (段上げ PR-2・設計 §4.3 の表): 段上げした task は束ねた Worker (CREWVIA_BIND_TASK) だけが取り、
+                    #     束ねた Worker は他の task を取らない。判定は dispatcher と同じ lib_worker_model.worker_may_take (target_dir の
+                    #     判定の後。コピーしない・env の停止スイッチは付けない)。壊れた model_override・読めない model.json も取らない。
+                    may_take_model, why_not_model = _WORKER_MODEL.worker_may_take_for(
+                        registry_dir(), agent, meta, slug)
+                    if not may_take_model:
+                        die(
+                            f"task '{specific_task}' は、この Worker には割り当てません: {why_not_model}。"
+                            f"取りません (何も書いていません)。",
                             PRECONDITION_UNMET,
                         )
                     # (2) 二重割り当て: 自分が別の task を持っている Worker は取らない。
@@ -4399,6 +4452,11 @@ def cmd_pull(args):
                     if task_td != effective_target:
                         target_mismatch += 1
                         continue
+                # モデルの束ね (段上げ PR-2): dispatcher と同じ判定。取れない task は候補にしない (束ねた Worker が
+                # 他の task を取らない・既定の Worker が段上げ済みの task を取らない)。
+                if not _WORKER_MODEL.worker_may_take_for(registry_dir(), agent, meta, slug)[0]:
+                    model_mismatch += 1
+                    continue
                 # failed
                 # deps HOLD the task until the Director releases them.
                 verdict = card_dependencies(meta, done_ids, task_statuses)
@@ -4432,20 +4490,26 @@ def cmd_pull(args):
             if pending_count == 0:
                 diag['reason'] = 'no_pending_tasks'
                 diag['detail'] = f'{scanned} task(s) scanned across {len(slugs)} mission(s); none pending'
-            elif skill_mismatch and not blocked_count and not target_mismatch:
+            elif model_mismatch and not (skill_mismatch or blocked_count or target_mismatch):
+                diag['reason'] = 'no_model_match'
+                diag['detail'] = (
+                    f'{pending_count} pending task(s) found but none can be taken by this Worker (model binding: '
+                    f'段上げ済みの task は CREWVIA_BIND_TASK で束ねた Worker だけが取り、束ねた Worker は他の task を取りません)'
+                )
+            elif skill_mismatch and not blocked_count and not target_mismatch and not model_mismatch:
                 diag['reason'] = 'no_skill_match'
                 diag['detail'] = (
                     f'{pending_count} pending task(s) found but none match skills '
                     f'{sorted(requested_skills) or "<any>"}'
                 )
-            elif target_mismatch and not skill_mismatch and not blocked_count:
+            elif target_mismatch and not skill_mismatch and not blocked_count and not model_mismatch:
                 diag['reason'] = 'no_target_match'
                 target_label = effective_target or '(crewvia-local)'
                 diag['detail'] = (
                     f'{pending_count} pending task(s) found but none match target_dir '
                     f'{target_label!r}'
                 )
-            elif blocked_count and not skill_mismatch and not target_mismatch:
+            elif blocked_count and not skill_mismatch and not target_mismatch and not model_mismatch:
                 diag['reason'] = 'all_blocked'
                 diag['detail'] = f'{blocked_count} pending task(s) blocked by unmet dependencies'
                 if held_tasks:
@@ -4455,7 +4519,7 @@ def cmd_pull(args):
                 diag['reason'] = 'no_eligible_task'
                 diag['detail'] = (
                     f'{pending_count} pending; {skill_mismatch} skill-mismatch; '
-                    f'{target_mismatch} target-mismatch; {blocked_count} blocked'
+                    f'{target_mismatch} target-mismatch; {model_mismatch} model-binding; {blocked_count} blocked'
                 )
                 if held_tasks:
                     diag['detail'] += ' — ' + '; '.join(
@@ -5747,6 +5811,21 @@ def _intent_blocker_findings(slug):
     return out
 
 
+def _model_override_findings(slug):
+    """card の `model_override` が別名でないものを**書かずに**列挙する (段上げ PR-2・設計 §4.8)。dispatcher はこの task を割り当てず、
+    pull は exit 3 で断る。出口は `plan.sh update <id> --model-override <別名>|none`。値そのものは出さない (型名だけ)。"""
+    out = []
+    if not os.path.isdir(mission_dir(slug)):
+        return out
+    for meta, _body in list_tasks(slug, quiet=True):
+        _ov, problem = _WORKER_MODEL.override_of(meta)
+        if problem:
+            out.append(_STORE.Finding('model-override-invalid', slug, meta.get('id'), None,
+                                      f"model_override is {type(meta.get('model_override')).__name__}, "
+                                      f"expected one of {'|'.join(_MODEL.ESCALATION_LADDER)}"))
+    return out
+
+
 def cmd_store_check(args):
     """plan.sh store-check [--mission <slug>]
 
@@ -5776,6 +5855,7 @@ def cmd_store_check(args):
         findings.append(_STORE.Finding(kind, mission, task, None, detail))
     for slug in history_slugs:
         findings.extend(_intent_blocker_findings(slug))
+        findings.extend(_model_override_findings(slug))
     for f in findings:
         fields = [f.kind]
         for key in ('mission', 'task', 'agent'):
@@ -6018,7 +6098,9 @@ def _print_mission_detail(slug):
             xmodel = m.get(_EXEC.EXECUTION_MODEL_FIELD)
             if isinstance(xmodel, str) and re.fullmatch(r'[A-Za-z0-9._\[\]-]{1,64}', xmodel):
                 exec_suffix += f" model={xmodel}"
-        print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
+        # 段上げの印 (別名のときだけ。壊れた値は store-check / lint が報告するので画面には出さない)
+        override_suffix = f" model={m['model_override']}↑" if _MODEL.is_alias(m.get('model_override')) else ''
+        print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}{override_suffix}")
         if st in _CI_STATUS.POLL_STATUSES:
             ci = ci_status_line(slug, tid, m)
             if ci:
@@ -7140,6 +7222,9 @@ def _update_close_execution(opts, task_id):
     with_lock(_do)
 
 
+_MO_UNSET = object()      # `update --model-override` が渡されなかった印 (None = none = 消す と区別)
+
+
 def cmd_update(args):
     """Update specific frontmatter fields of an existing task.
 
@@ -7213,6 +7298,7 @@ def cmd_update(args):
         '--idle-timeout': 'value',
         '--max-timeout': 'value',
         '--blocked-reason': 'value',
+        '--model-override': 'value',
     })
 
     if not positional:
@@ -7222,6 +7308,17 @@ def cmd_update(args):
         _update_close_execution(opts, task_id)
         return
     deliverable = _parse_deliverable_opt(opts)
+    # 段上げの印 (card の model_override。PR-2)。別名 (haiku / sonnet / opus) か none (消す) だけ。何かを書く前に検査する
+    # (exit 2・何も書かない)。Director の手で使う。`add` は受け付けない (最初から上げたいなら skills か env で。設計 §4.4)。
+    model_override_update = _MO_UNSET
+    if '--model-override' in opts:
+        raw_mo = opts['--model-override']
+        if raw_mo == 'none':
+            model_override_update = None
+        elif _MODEL.is_alias(raw_mo):
+            model_override_update = raw_mo
+        else:
+            _usage_exit(f"--model-override は {'|'.join(_MODEL.ESCALATION_LADDER)}|none のどれかです (指定: {raw_mo!r})。何も書いていません")
 
     # Validate task_id format
     if not re.fullmatch(r't\d+', task_id):
@@ -7457,6 +7554,16 @@ def cmd_update(args):
         if deliverable is not None:
             meta['deliverable'] = deliverable
             changed.append(f"deliverable={deliverable}")
+
+        if model_override_update is not _MO_UNSET:
+            if model_override_update is None:
+                # none: 印と、段上げの通知の数・fingerprint (PR-3 が書く欄。PR-2 では書き手が無いが、消す口はここ 1 つ) を一緒に消す
+                for k in ('model_override', 'model_at_cap_count', 'model_at_cap_execution'):
+                    meta.pop(k, None)
+                changed.append('model_override=none')
+            else:
+                meta['model_override'] = model_override_update
+                changed.append(f"model_override={model_override_update}")
 
         if idle_timeout_opt or max_timeout_opt:
             # 既存の timeout dict とマージする (--max-timeout だけ渡したら idle は保つ)。
@@ -8158,6 +8265,7 @@ dispatch = {
     'store-check': cmd_store_check,
     'history': cmd_history,
     'pr-base': cmd_pr_base,
+    'model-for': cmd_model_for,
     'resolve-pr': cmd_resolve_pr,
     'ci-gate': cmd_ci_gate,
 }

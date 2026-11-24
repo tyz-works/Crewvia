@@ -165,6 +165,17 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
             except ValueError:
                 results.append(('FAIL', 'frontmatter', f"{prefix}: 'pr_repo' must be owner/name"))
 
+        # `model_override` (段上げの印。モデルの段上げ PR-2): 別名 (haiku / sonnet / opus) だけ。壊れた card は dispatcher が
+        # 割り当てず pull も断る (既定モデルに黙って倒さない) ので、先に FAIL にする。判定は lib_worker_model.override_of の 1 か所。
+        _override, _problem = _import_scripts_module('lib_worker_model').override_of(meta)
+        if _problem:
+            results.append(('FAIL', 'frontmatter', f"{prefix}: {_problem}"))
+        # `model_at_cap_count` (opus のまま差し戻された回数。PR-3 が書く): 負でない整数だけ (bool は不可)
+        if 'model_at_cap_count' in meta:
+            _n = meta['model_at_cap_count']
+            if isinstance(_n, bool) or not isinstance(_n, int) or _n < 0:
+                results.append(('FAIL', 'frontmatter', f"{prefix}: 'model_at_cap_count' must be a non-negative integer"))
+
         if not results or all(level != 'FAIL' for level, *_ in results):
             pass  # OK entries added by caller
 

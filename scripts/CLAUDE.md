@@ -85,7 +85,18 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   pull が card の `execution_model`・record の `model`・台帳の `model`（閉じた試行の分）に写す。**記録が無い・読めない・モデルが空なら欄を書かない**（`unknown` を作らない・pull は止めない）。
 - `reserve` は前の試行の `execution_model` を消す（持ち越さない）。`execution_model` は `EXECUTION_FIELDS` に**入れない**（欄の無い card が今と同じに読める）。
 - **plan.sh は `lib_task_cards` を別に読み込むので `Unreadable` / `is_missing` の isinstance は lib 側とは別のクラス**。「無い / 読めない / 値」の判定は lib の関数に閉じ、plan.sh で `rec['…']` や `is_missing(rec)` を直接使わない。
-- PR-1 は割り当てを変えない（`worker_may_take` は PR-2）。戻し方: revert → sync。`model.json`・card の `execution_model`・record の `model`・台帳の `model` は残ってよい（旧コードは読まない）。
+- PR-1 は割り当てを変えない。戻し方: revert → sync。`model.json`・card の `execution_model`・record の `model`・台帳の `model` は残ってよい（旧コードは読まない）。
+
+### モデルの段上げ PR-2: `model_override` の欄と Worker の束ね（設計 §4.3〜§4.5・§4.8）
+
+- **別名の段は `lib_model.ESCALATION_LADDER` の 1 か所**（`is_alias` / `alias_of` / `escalate` / `effective_model`）。`model_override`（card の欄・別名だけ・`add` は受け付けない）の検査は plan.sh の `update` / lint / store-check / dispatcher / pull が全部これと `lib_worker_model.override_of` を通す。壊れた値は既定モデルに倒さず、dispatcher は割り当てず（Director に `model-override-invalid-<slug>-<tid>` を 1 回）、pull は exit 3、`model-for` は exit 1。
+- **割り当ての判定は `lib_worker_model.worker_may_take(record, task_meta, slug)` の 1 関数**（§4.3 の表）。dispatcher は `worker_may_take_task(agent, meta, slug)` の 1 か所で `lib_worker_target` の後に AND（割り当て・退役の `takeable_pending`・`no_worker` の 3 か所が全部ここ。理由は最初に断った 1 つ）。plan.sh pull は `_WORKER_MODEL.worker_may_take_for()`（記録の読み込みごと lib の中。`Unreadable` の isinstance を plan.sh 側でしない）を `--task` の照合（exit 3）と自動の絞り込みで呼ぶ。**env の停止スイッチは付けない**。
+- **退役**（dispatcher）: `_rec_known = _target_known and (is_missing(model.json) or not is_unreadable(model.json))`。model.json が**無い** Worker は override の task を永久に取れないので退役でよい・**読めない**ときは待機（ログのキーは `model_rec_unknown_<Name>`。TARGET_DIR の記録のせいなら従来の `target_only_<Name>`）。task が 1 つも残っていなければ（`has_any` が偽）今どおり退役。
+- `plan.sh update --model-override haiku|sonnet|opus|none`（`none` は `model_at_cap_*` も消す）・`plan.sh model-for <tid> --mission <slug>`（読み取り専用・ロックなし・`_INTENT_FREEZE` は allow・決められなければ exit 1 で stdout 空）。status は `model=opus↑`、pull の JSON は別名のときだけ `model_override`。
+- start.sh: `CREWVIA_BIND_TASK=<slug>/<tid>`（worker だけ）。モデルは `plan.sh model-for` から（明示 env > card の実効モデル > 既定。env が低いと警告）、`model.json` に `bound_task`・`source: override`、kickoff は `plan pull --task … --mission …`。値が壊れている・card が無い・`model-for` が失敗なら**起動しない**（exit 1・`refusals.log` の `kind=bind-task`）。`CREWVIA_WORKER_MODEL` は束ねた起動コマンドに付けない（人の明示と区別できなくなる）。
+- `worker_start_command` は `--fresh --exclude <同じ skills の生きている名前>`（プール枯渇対策）と、段上げ済みの task なら `CREWVIA_BIND_TASK` + 「モデル: sonnet → opus（段上げ）」。
+- 自動の段上げ（reopen・verify-result fail・`retry --escalate-model`）・`model_at_cap_*` の書き手と通知は PR-3。戻し方: revert → sync（束ねた Worker が生きていれば先に退役させる）。card の `model_override` は残ってよい（旧コードは無視）。
+- テスト: `tests/test_model_override_pr2.py`（表の総当たり・退役の総当たり・AST・plan.sh）/ `tests/start-sh-model-bind.bats`。赤の実証: `_rec_known` から `_model_known` を外す / `worker_may_take` を「常に取れる」にすると赤になる。
 
 ## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元は plan.sh だけ**: pull（E2 / t008）・done / fail / needs-director / ready-for-verification / verifying / verify-result と `update --close-execution`（E3 / t012））
 

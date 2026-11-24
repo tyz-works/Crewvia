@@ -77,6 +77,13 @@ def test_no_usable_record_writes_no_field_and_pull_still_works(box, how):
     elif how == "model_null":
         wm.write_record(box.root / "registry", "Ren", "none", None)
     p = box.pull(agent)
+    if how in ("broken_json", "bad_shape", "blank_model"):
+        # PR-2 (設計 §4.3 の表): 読めない記録の Worker は、束ねられているか分からないので task を取らない (保留)。
+        # 何も書かない (execution_model を作らない)。pull を止めない = 記録が「無い」Worker だけ (下の missing / model_null)
+        assert p.returncode == 3, p.stderr
+        assert "model.json" in p.stderr and "execution_model を書きません" in p.stderr
+        assert "execution_model" not in box.card()
+        return
     assert p.returncode == 0, p.stderr
     res = json.loads(p.stdout)
     assert "execution_model" not in res

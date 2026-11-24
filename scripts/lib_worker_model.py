@@ -5,7 +5,7 @@
 
 試行の記録 (card・record・台帳) には「どのモデルで走ったか」が無い。解決したモデルは `start.sh` の `LAUNCH_CMD` の
 `--model` に入るだけで、どこにも残らなかった。段上げ (後続の PR) は「前の試行のモデル」を起点にするので、まず記録する。
-この PR は**書いて見せるだけ**で、割り当ての判定は変えない (`worker_may_take` は PR-2)。
+PR-1 は**書いて見せるだけ**で、割り当ての判定は変えなかった。PR-2 で `worker_may_take` (下) が加わった。
 
 ## 置き場: `registry/workers/<Name>/model.json`
 
@@ -17,7 +17,7 @@
 - `model`: 起動で解決したモデル (`SELECTED_MODEL`)。空 (= `--model` なし = CLI の既定) は `null`。
 - `source`: `env` (人が `CREWVIA_WORKER_MODEL` を明示) / `override` (段上げ。PR-2 以降) / `skill` (`model_per_skill` か
   `worker_model`) / `none` (解決が空)。
-- `bound_task`: 束ねた Worker のとき `"<slug>/<tid>"`。PR-1 では常に `null`。
+- `bound_task`: 束ねた Worker (`CREWVIA_BIND_TASK=<slug>/<tid>` で起動) のとき `"<slug>/<tid>"`。それ以外は `null`。
 
 ## 読み方
 
@@ -31,8 +31,16 @@ CLI (start.sh が使う):
 
     lib_worker_model.py record <registry_dir> <agent> <source> [<model> [<bound_task>]]   # 原子的に書く
     lib_worker_model.py show   <registry_dir> <agent>
+
+## 割り当ての判定 `worker_may_take` (PR-2。設計 §4.3 の表)
+
+dispatcher (`worker_may_take_task`) と plan.sh pull (`--task` の照合・自動の絞り込み) が**同じ関数**を呼ぶ
+(`lib_worker_target.worker_may_take` と AND。コピーしない)。**env の停止スイッチは付けない** (不変条件 5)。
+plan.sh は `lib_task_cards` を別に読み込むので、記録を読む側の `is_missing` が別のクラスを見て食い違う
+(§12 の PR-1 実装メモ)。plan.sh は記録の読み込みごと lib に任せる `worker_may_take_for()` を使う。
 """
 
+import errno
 import json
 import math
 import os
@@ -45,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib_daemon_state import load_json_store  # noqa: E402
 from lib_task_cards import Unreadable, is_missing, is_unreadable  # noqa: E402
+import lib_model as _model  # noqa: E402
 import lib_worker_target as _target  # noqa: E402
 
 #: `source` の語彙。
@@ -154,6 +163,86 @@ def recorded_model(registry_dir, agent):
     if is_unreadable(rec):
         return None, f"{agent} のモデルの記録を読めないので execution_model を書きません ({rec.reason})"
     return rec['model'], None
+
+
+def override_of(task_meta):
+    """card の `model_override`。`(別名 | None, 問題 | None)`。欄が**無い**なら `(None, None)`。
+    あるのに別名でない (手編集・型違い・None・版つき ID) は `(None, 理由)` — 既定に倒さない (§4.8)。"""
+    if 'model_override' not in task_meta:
+        return None, None
+    value = task_meta['model_override']
+    if _model.is_alias(value):
+        return value, None
+    return None, (f"card の model_override が {_model.ESCALATION_LADDER} の別名ではありません ({value!r})。"
+                  f"出口: plan.sh update <id> --model-override <別名>|none")
+
+
+def record_state(record):
+    """`'missing'`(PR-1 より前に起動) / `'unreadable'`(壊れ・権限・形の違い) / `'known'`。`is_missing` を先に見る。"""
+    if is_missing(record):
+        return 'missing'
+    if is_unreadable(record):
+        return 'unreadable'
+    return 'known'
+
+
+def bound_key(slug, task_id):
+    return f'{slug}/{task_id}'
+
+
+def worker_may_take(record, task_meta, slug):
+    """この記録を持つ Worker に task (`task_meta`・mission `slug`) を割り当ててよいか — `(可否, 理由)`。**唯一の定義**で、
+    設計 §4.3 の表がその全部。理由は人間向けの 1 行 (可のときは空)。
+
+    | model_override | Worker の記録 | 結果 |
+    |---|---|---|
+    | 壊れている | 何でも | 取らない (§4.8) |
+    | 無い | 無い (missing) | 取れる (PR-1 より前に起動した Worker を止めない) |
+    | 無い | 読めない | 取らない (束ねられているか分からない) |
+    | 無い | bound_task が null / この task | 取れる |
+    | 無い | bound_task が別の task | 取らない |
+    | ある | bound_task == この task | 取れる |
+    | ある | bound_task null ∧ source env ∧ ランク ≥ override | 取れる (人が明示して高いモデルで起動した Worker) |
+    | ある | 上記以外 (無い・読めない・skill の既定・ランク不足・別の task に束縛) | 取らない |
+    """
+    override, problem = override_of(task_meta)
+    if problem:
+        return False, problem
+    me = bound_key(slug, task_meta.get('id'))
+    state = record_state(record)
+    if override is None:
+        if state == 'missing':
+            return True, ''
+        if state == 'unreadable':
+            return False, 'モデルの記録 (model.json) が読めないため、束ねた Worker かどうか分からない (保留)'
+        bound = record['bound_task']
+        if bound is None or bound == me:
+            return True, ''
+        return False, f'この Worker は {bound} に束ねられており、他の task は担当しない'
+    if state == 'missing':
+        return False, (f'この task は {override} に段上げ済みですが、この Worker のモデルの記録 (model.json) が無い '
+                       f'(PR-1 より前に起動した Worker) ため割り当てない')
+    if state == 'unreadable':
+        return False, f'この task は {override} に段上げ済みですが、この Worker のモデルの記録が読めないため割り当てない (保留)'
+    bound = record['bound_task']
+    if bound == me:
+        return True, ''
+    if bound is not None:
+        return False, f'この Worker は {bound} に束ねられており、{me} は担当しない'
+    have = _model.alias_of(record['model'])
+    if (record['source'] == 'env' and have is not None
+            and _model.ESCALATION_LADDER.index(have) >= _model.ESCALATION_LADDER.index(override)):
+        return True, ''
+    return False, (f'この task は {override} に段上げ済みです。{me} に束ねて起動した Worker '
+                   f'(CREWVIA_BIND_TASK={me}) が取ります (この Worker のモデル: {record["model"] or "CLI の既定"})')
+
+
+def worker_may_take_for(registry_dir, agent, task_meta, slug, warn=None):
+    """plan.sh pull 用: 記録の読み込みごとここで済ませる。`agent` が無い (`--agent` なし) ときは記録が「無い」扱い
+    (override の task は取らず、無い task は取る)。"""
+    if not agent:
+        return worker_may_take(Unreadable('(no --agent)', 'no agent', errno=errno.ENOENT), task_meta, slug)
+    return worker_may_take(load_record(registry_dir, agent, warn=warn), task_meta, slug)
 
 
 def _main(argv):

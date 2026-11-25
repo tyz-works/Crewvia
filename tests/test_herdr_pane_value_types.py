@@ -89,3 +89,77 @@ def test_tab_create_wrong_shapes_fail_without_exception(monkeypatch, tab_create)
         monkeypatch, {"result": {"panes": []}}, tab_create)
     assert b.spawn("Omar-worker", "true") is False
     assert "pane_run" not in calls and written == []
+
+
+# ---- _workspace_id の workspace 一覧 (attempt 2 / Seo P2) ----
+# 不変条件: workspaces が list で、要素が全部 dict で、label が None か str のときだけ読める一覧。
+# それ以外は None を返し workspace_create を呼ばない (読めない一覧を「目的の workspace が無い」と読まない)。
+
+def _ws_backend(monkeypatch, workspace_list_result):
+    calls = []
+
+    def fake_run(verb, args=None, timeout=None):
+        calls.append(verb)
+        if verb == "workspace_list":
+            return workspace_list_result
+        if verb == "workspace_create":
+            return {"result": {"workspace": {"workspace_id": "ws-new"}}}
+        if verb == "pane_list":
+            return {"result": {"panes": []}}
+        if verb == "tab_create":
+            return {"result": {"tab": {"tab_id": "t1"},
+                               "root_pane": {"pane_id": "p1"}}}
+        return {"result": {}}
+
+    monkeypatch.setattr(lib_mux, "_herdr_run", fake_run)
+    monkeypatch.setenv("CREWVIA_HERDR_WORKSPACE", "crewvia-pytest-ws")
+    b = lib_mux.HerdrBackend()
+    monkeypatch.setattr(b, "_guard", lambda *a, **k: None, raising=False)
+    written = []
+    monkeypatch.setattr(b, "_write_cache", lambda *a, **k: written.append(a))
+    ran = []
+    monkeypatch.setattr(b, "_pre_launch_ok", lambda name: ran.append(1) or True)
+    return b, calls, ran, written
+
+
+BAD_WORKSPACES = [
+    ["crewvia-pytest-ws"],                                       # dict でない要素
+    [None, {"label": "other", "workspace_id": "w2"}],            # None 要素
+    [{"label": "other", "workspace_id": "w2"}, 3],
+    [{"label": 5, "workspace_id": "w2"}],                         # label が数値
+    [{"label": ["crewvia-pytest-ws"], "workspace_id": "w2"}],
+    [{"label": True, "workspace_id": "w2"}],
+    "crewvia-pytest-ws",                                         # workspaces が list でない
+    {"label": "crewvia-pytest-ws"},
+]
+
+
+@pytest.mark.parametrize("workspaces", BAD_WORKSPACES)
+def test_unreadable_workspace_list_does_not_create(monkeypatch, workspaces):
+    b, calls, *_ = _ws_backend(monkeypatch, {"result": {"workspaces": workspaces}})
+    assert b._workspace_id() is None
+    assert "workspace_create" not in calls
+
+
+@pytest.mark.parametrize("workspaces", BAD_WORKSPACES)
+def test_unreadable_workspace_list_refuses_spawn(monkeypatch, workspaces):
+    b, calls, ran, written = _ws_backend(
+        monkeypatch, {"result": {"workspaces": workspaces}})
+    assert b.spawn("Omar-worker", "true") is False
+    assert "workspace_create" not in calls
+    assert "tab_create" not in calls
+    assert ran == [] and written == []
+
+
+def test_readable_workspace_list_finds_or_creates(monkeypatch):
+    b, calls, *_ = _ws_backend(monkeypatch, {"result": {"workspaces": [
+        {"label": None, "workspace_id": "w0"},
+        {"workspace_id": "w1"},
+        {"label": "crewvia-pytest-ws", "workspace_id": "w2"}]}})
+    assert b._workspace_id() == "w2"
+    assert "workspace_create" not in calls
+
+    b, calls, *_ = _ws_backend(monkeypatch, {"result": {"workspaces": [
+        {"label": "other", "workspace_id": "w1"}]}})
+    assert b._workspace_id() == "ws-new"
+    assert calls.count("workspace_create") == 1

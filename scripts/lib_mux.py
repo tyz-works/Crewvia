@@ -3416,6 +3416,27 @@ def _herdr_panes(data) -> Optional[list]:
     return panes
 
 
+def _herdr_workspaces(data) -> Optional[list]:
+    """`workspace list` の応答から workspaces を読む。形が読めなければ None。
+
+    読める形 = result.workspaces が list で、要素が全部 dict で、label が None (欄なしを含む) か str。
+    dict でない要素・型の違う label が 1 つでもあれば一覧全体を読めない扱い (その要素が目的の
+    workspace かもしれない = 「無い」とは言えない)。呼び側 (`_workspace_id`) は None なら
+    workspace_create に進まない (空の新 workspace で同名の Worker を二重起動しない)。
+    """
+    res = data.get("result") if isinstance(data, dict) else None
+    workspaces = res.get("workspaces") if isinstance(res, dict) else None
+    if not isinstance(workspaces, list):
+        return None
+    for ws in workspaces:
+        if not isinstance(ws, dict):
+            return None
+        v = ws.get("label")
+        if v is not None and not isinstance(v, str):
+            return None
+    return workspaces
+
+
 def _herdr_result_dict(data, key: str) -> Optional[dict]:
     """応答の `result[key]` が dict ならそれ、それ以外 (欄なし・型違い) は None。"""
     res = data.get("result") if isinstance(data, dict) else None
@@ -3694,12 +3715,11 @@ class HerdrBackend(_Backend):
         data = _herdr_run("workspace_list", [], timeout=10)
         if data is None:
             return None
-        res = data.get("result") if isinstance(data, dict) else None
-        workspaces = res.get("workspaces") if isinstance(res, dict) else None
-        if not isinstance(workspaces, list):
+        workspaces = _herdr_workspaces(data)
+        if workspaces is None:
             return None  # 読めない一覧から workspace を作らない (重複作成しない側)
         for ws in workspaces:
-            if isinstance(ws, dict) and ws.get("label") == label:
+            if ws.get("label") == label:
                 wid = ws.get("workspace_id")
                 return wid if isinstance(wid, str) and wid else None
 

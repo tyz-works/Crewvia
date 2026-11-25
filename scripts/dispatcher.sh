@@ -1044,13 +1044,18 @@ def worker_outstanding_assignment(agent_name, all_tasks):
     return None
 
 
-def worker_start_command(task_skills, target_dir, *, exclude=(), bind_task=None):
+def worker_start_command(task_skills, target_dir, *, bind_task=None):
     """Director がそのまま貼れる Worker 起動コマンド (`director.md` の起動手順と同じ形)。
 
-    名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
-    `exclude`: 今生きている Worker の名前 (skills を問わない)。**`--fresh` は付けない**: `--fresh` は
-    「registry に未登録の名前」しか取らず、名前のプールが尽きると空を返す (11-05・11-25 に実害)。
-    `--exclude` だけなら、登録済みで今は生きていない名前 (歴代継承) に回れる。
+    名前は**貼った時点で**決める (dispatcher が registry を書き換えない):
+    `LIVE=$(lib_worker_target.py alive <registry>)` が貼った時点で生きている Worker (窓が有る ∪ heartbeat が新しい。
+    dispatcher の `_alive_workers` と同じ 1 つの定義 `lib_worker_target.alive_workers`。skills は問わない) を
+    観測し、それを `assign-name.sh --exclude` に渡す。通知の時点のスナップショットは使わない
+    (通知から貼るまでに起動した Worker の名前を返して start.sh が『既に居る』で断る、が 11-25 の P3)。
+    **観測できなければ** (`alive` が非 0 = mux 不達・heartbeat の dir が読めない) `&&` で止まり、
+    名前を決めない = 何も起動しない。空の集合には倒さない。
+    **`--fresh` は付けない**: `--fresh` は「registry に未登録の名前」しか取らず、名前のプールが尽きると
+    空を返す (11-05・11-25 に実害)。`--exclude` だけなら、登録済みで今は生きていない名前 (歴代継承) に回れる。
     名前が決まらなければ (候補が無い = assign-name.sh が非 0 / 空) `start.sh` は走らない
     (`AGENT_NAME=$(…) && [ -n "$AGENT_NAME" ] && …`。空の名前・生きている Worker の名前で起動しない)。
     `bind_task` (`<slug>/<tid>`): 段上げした task 専用の
@@ -1070,11 +1075,13 @@ def worker_start_command(task_skills, target_dir, *, exclude=(), bind_task=None)
             backend = 'herdr'
     target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
     bind = f"CREWVIA_BIND_TASK={shlex.quote(bind_task)} " if bind_task else ''
-    excl = f" --exclude {shlex.quote(','.join(exclude))}" if exclude else ''
+    # alive も start.sh と同じ backend を見る (CREWVIA_MUX を前置代入する)。
+    mux_env = f"CREWVIA_MUX={shlex.quote(backend)}"
     return (
         f"cd {shlex.quote(str(REPO_ROOT))} && "
-        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{excl}) && [ -n \"$AGENT_NAME\" ] && "
-        f"AGENT_NAME=\"$AGENT_NAME\" {target}{bind}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
+        f"LIVE=$({mux_env} python3 scripts/lib_worker_target.py alive {shlex.quote(str(REGISTRY_DIR))}) && "
+        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills} --exclude \"$LIVE\") && [ -n \"$AGENT_NAME\" ] && "
+        f"AGENT_NAME=\"$AGENT_NAME\" {target}{bind}CREWVIA_MUX_ENABLED=1 {mux_env} "
         f"bash scripts/start.sh worker {skills}"
     )
 
@@ -1381,7 +1388,7 @@ def tmux_list_worker_windows():
     """
     names = _mux.list(suffix='-worker')
     return [
-        {'window_target': name, 'agent_name': name[:-len('-worker')]}
+        {'window_target': name, 'agent_name': _worker_target.agent_of_window(name)}
         for name in names
     ]
 
@@ -1789,7 +1796,7 @@ def in_spawn_grace(window_target: str) -> bool:
 # Main dispatch logic
 # ---------------------------------------------------------------------------
 
-AGENT_PRESENCE_TTL = 600  # 10 minutes — heartbeat files older than this are ignored
+AGENT_PRESENCE_TTL = _worker_target.AGENT_PRESENCE_TTL  # heartbeat files older than this are ignored (定義は lib 1 か所)
 
 
 def publish_agents():
@@ -2909,22 +2916,12 @@ def dispatch():
     #     false "no worker" notification fired (OBS-1 symptom).
     #   - Both stale + no window → truly dead → can_handle=False (correct).
     _window_agent_names: set = {w['agent_name'] for w in windows}
-    _hb_dir = REGISTRY_DIR / 'heartbeats'
-    # Seed with all window-present workers first: window exists → alive (OR condition, complete).
-    # Fresh-spawn Workers write their first heartbeat only on their first tool invocation
-    # (hooks/post-tool-use.sh line 79), so iterating heartbeat files alone misses them.
-    # The heartbeat loop below unions in heartbeat-fresh Workers (e.g. herdr transient []).
-    _alive_workers: set = set(_window_agent_names)
-    if _hb_dir.exists():
-        _now_hb = time.time()
-        for _hb_file in _hb_dir.iterdir():
-            if _hb_file.is_file() and not _hb_file.name.startswith('.'):
-                try:
-                    _hb_fresh = _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL
-                    if _hb_fresh:  # heartbeat fresh → alive (union with window seed above)
-                        _alive_workers.add(_hb_file.name)
-                except OSError:
-                    pass
+    # 定義は lib_worker_target.alive_workers の 1 か所 (起動コマンドの `alive` と共有)。
+    try:
+        _alive_workers: set = _worker_target.alive_workers(_window_agent_names, REGISTRY_DIR)
+    except OSError as _e:
+        log(f"WARNING: heartbeats dir unreadable ({_e!r}); alive set = windows only")
+        _alive_workers = set(_window_agent_names)
 
     sweep_stale_target_records(_alive_workers)
 
@@ -3281,8 +3278,7 @@ def dispatch():
                     msg += f" — モデル: {_base or '既定'} → {_ov}（段上げ）"
                 msg += (
                     f"。起動コマンド: "
-                    + worker_start_command(task_skills, meta.get('target_dir'),
-                                           exclude=sorted(_alive_workers), bind_task=bind)
+                    + worker_start_command(task_skills, meta.get('target_dir'), bind_task=bind)
                 )
                 if tmux_send(_director_name(), msg):
                     record_notify(notify_key)

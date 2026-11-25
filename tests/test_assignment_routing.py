@@ -932,8 +932,9 @@ class TestStartCommandWhenNamePoolIsExhausted:
     """t001 (20261125): プールが尽きても、貼った起動コマンドは空でない・生きていない名前で起動する。
     候補が無いときは start.sh を走らせない。"""
 
-    def _run(self, tmp_path, registry_names, alive, bind=None):
-        import subprocess, shutil
+    def _run(self, tmp_path, registry_names, alive, bind=None, skills_by_name=None):
+        import subprocess
+        skills_by_name = skills_by_name or {}
         root = tmp_path / "r"
         (root / "scripts").mkdir(parents=True)
         (root / "config").mkdir()
@@ -946,7 +947,7 @@ class TestStartCommandWhenNamePoolIsExhausted:
         (root / "registry").mkdir()
         (root / "registry" / "workers.yaml").write_text(
             "workers:\n" + "".join(
-                f"  - name: {n}\n    role: ''\n    skills: [code]\n    task_count: 0\n    last_active: '2026-01-01'\n"
+                f"  - name: {n}\n    role: ''\n    skills: [{skills_by_name.get(n, 'code')}]\n    task_count: 0\n    last_active: '2026-01-01'\n"
                 for n in registry_names))
         (root / "scripts" / "start.sh").write_text('#!/usr/bin/env bash\necho "STARTED:$AGENT_NAME"\n')
         cmd = _worker_start_command_for_test(["code"], exclude=alive, bind_task=bind)
@@ -967,13 +968,31 @@ class TestStartCommandWhenNamePoolIsExhausted:
         r = self._run(tmp_path, ["Aoi", "Ren"], alive=["Aoi", "Ren"])
         assert r.returncode != 0 and "STARTED" not in r.stdout
 
+    def test_other_skills_alive_worker_is_excluded(self, tmp_path):
+        # Aoi は別 skills (research) で生きている。assign-name.sh の fallback は skills を見ずに
+        # プールの先頭を返すので、--exclude に Aoi が無いと Aoi で start.sh が走ってしまう。
+        r = self._run(tmp_path, ["Aoi", "Ren"], alive=["Aoi"],
+                      skills_by_name={"Aoi": "research", "Ren": "research"})
+        assert r.returncode == 0 and "STARTED:Ren" in r.stdout, r.stderr
+        # 同じ skills の名前だけを exclude にした場合 (退行) は Aoi が選ばれる
+        (tmp_path / "bad").mkdir()
+        bad = self._run(tmp_path / "bad", ["Aoi", "Ren"], alive=[],
+                        skills_by_name={"Aoi": "research", "Ren": "research"})
+        assert "STARTED:Aoi" in bad.stdout
+
+    def test_call_site_excludes_every_alive_worker_regardless_of_skills(self):
+        # 起動コマンドの --exclude は _alive_workers (skills を問わない)。skill_ok に戻すと赤。
+        import re
+        src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dispatcher.sh").read_text()
+        m = re.search(r"worker_start_command\(task_skills, meta\.get\('target_dir'\),\s*exclude=([^,]+?),", src)
+        assert m and m.group(1).strip() == "sorted(_alive_workers)", m and m.group(1)
+
 
 def _worker_start_command_for_test(skills, **kw):
-    import re, textwrap
+    import re
     src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dispatcher.sh").read_text()
     m = re.search(r"^def worker_start_command\(.*?(?=^def )", src, re.S | re.M)
     ns = {"shlex": __import__("shlex"), "os": __import__("os"), "REPO_ROOT": pathlib.Path("/x")}
-    os_env = {"CREWVIA_MUX": "tmux"}
     import os
     old = os.environ.get("CREWVIA_MUX"); os.environ["CREWVIA_MUX"] = "tmux"
     try:

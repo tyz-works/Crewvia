@@ -842,8 +842,10 @@ class TestDispatcherRouting:
         msg = msgs[0]
         assert f"TARGET_DIR={OTHER_REPO}" in msg
         assert "CREWVIA_MUX_ENABLED=1" in msg and "CREWVIA_MUX=" in msg
-        assert f"AGENT_NAME=$(bash scripts/assign-name.sh code --exclude {AGENT}) && [ -n \"$AGENT_NAME\" ] && " in msg, (
-            "同じ skill の Worker が (別 TARGET_DIR で) 居るので別の名前を取らせる。--fresh は付けない (プール枯渇で空になる)")
+        assert "LIVE=$(CREWVIA_MUX=" in msg and "scripts/lib_worker_target.py alive " in msg and (
+            "&& AGENT_NAME=$(bash scripts/assign-name.sh code --exclude \"$LIVE\") && [ -n \"$AGENT_NAME\" ] && ") in msg, (
+            "名前は貼った時点で生きている Worker (alive) を除いて取らせる。通知時点の名前を埋めない。--fresh は付けない (プール枯渇で空になる)")
+        assert f"--exclude {AGENT}" not in msg
         assert "--fresh" not in msg
         assert "bash scripts/start.sh worker code" in msg
         assert "担当できません" in msg
@@ -930,10 +932,9 @@ def test_dispatcher_and_pull_agree_on_target_matching(sb, tmp_path):
 
 class TestStartCommandWhenNamePoolIsExhausted:
     """t001 (20261125): プールが尽きても、貼った起動コマンドは空でない・生きていない名前で起動する。
-    候補が無いときは start.sh を走らせない。"""
+    候補が無いときは start.sh を走らせない。生きている Worker は**貼った時点**で観測する (偽の tmux)。"""
 
-    def _run(self, tmp_path, registry_names, alive, bind=None, skills_by_name=None):
-        import subprocess
+    def _setup(self, tmp_path, registry_names, skills_by_name=None):
         skills_by_name = skills_by_name or {}
         root = tmp_path / "r"
         (root / "scripts").mkdir(parents=True)
@@ -950,9 +951,40 @@ class TestStartCommandWhenNamePoolIsExhausted:
                 f"  - name: {n}\n    role: ''\n    skills: [{skills_by_name.get(n, 'code')}]\n    task_count: 0\n    last_active: '2026-01-01'\n"
                 for n in registry_names))
         (root / "scripts" / "start.sh").write_text('#!/usr/bin/env bash\necho "STARTED:$AGENT_NAME"\n')
-        cmd = _worker_start_command_for_test(["code"], exclude=alive, bind_task=bind)
-        cmd = cmd.split(" && ", 1)[1]  # cd <repo> を外して tmp_path の root で走らせる
-        return subprocess.run(["bash", "-c", f"cd {root} && {cmd}"], capture_output=True, text=True)
+        return root
+
+    def _fake_tmux(self, root, windows, server_up=True):
+        """tmux の偽物: list-sessions (server_running) と list-windows (名前を 1 行ずつ)。windows は貼る時点で書き換える。"""
+        fb = root / "fakebin"
+        fb.mkdir(exist_ok=True)
+        (root / "windows.txt").write_text("".join(f"{w}-worker\n" for w in windows))
+        (fb / "tmux").write_text(
+            "#!/usr/bin/env bash\n"
+            f'case "$1" in\n'
+            f'  list-sessions) exit {0 if server_up else 1} ;;\n'
+            f'  list-windows) cat "{root}/windows.txt" ;;\n'
+            f'  *) exit 1 ;;\n'
+            "esac\n")
+        (fb / "tmux").chmod(0o755)
+        return fb
+
+    def _command(self, root, bind=None):
+        cmd = _worker_start_command_for_test(["code"], registry_dir=root / "registry", bind_task=bind)
+        return cmd.split(" && ", 1)[1]  # cd <repo> を外して tmp_path の root で走らせる
+
+    def _paste(self, root, cmd):
+        import subprocess, os
+        env = dict(os.environ)
+        env["PATH"] = f"{root / 'fakebin'}:{env['PATH']}"
+        env["CREWVIA_TMUX_SESSION"] = "crewvia-pytest-startcmd"
+        env["CREWVIA_MUX_TEST_ISOLATION"] = "1"
+        env["CREWVIA_MUX_PANE_PREFIX"] = ""
+        return subprocess.run(["bash", "-c", f"cd {root} && {cmd}"], capture_output=True, text=True, env=env)
+
+    def _run(self, tmp_path, registry_names, alive, bind=None, skills_by_name=None):
+        root = self._setup(tmp_path, registry_names, skills_by_name)
+        self._fake_tmux(root, alive)
+        return self._paste(root, self._command(root, bind))
 
     def test_exhausted_pool_reuses_a_registered_dead_name(self, tmp_path):
         r = self._run(tmp_path, ["Aoi", "Ren", "Luna"], alive=["Aoi"])
@@ -970,29 +1002,88 @@ class TestStartCommandWhenNamePoolIsExhausted:
 
     def test_other_skills_alive_worker_is_excluded(self, tmp_path):
         # Aoi は別 skills (research) で生きている。assign-name.sh の fallback は skills を見ずに
-        # プールの先頭を返すので、--exclude に Aoi が無いと Aoi で start.sh が走ってしまう。
+        # プールの先頭を返すので、生きている全員 (skills を問わない) を除かないと Aoi で start.sh が走る。
         r = self._run(tmp_path, ["Aoi", "Ren"], alive=["Aoi"],
                       skills_by_name={"Aoi": "research", "Ren": "research"})
         assert r.returncode == 0 and "STARTED:Ren" in r.stdout, r.stderr
-        # 同じ skills の名前だけを exclude にした場合 (退行) は Aoi が選ばれる
-        (tmp_path / "bad").mkdir()
-        bad = self._run(tmp_path / "bad", ["Aoi", "Ren"], alive=[],
-                        skills_by_name={"Aoi": "research", "Ren": "research"})
-        assert "STARTED:Aoi" in bad.stdout
 
-    def test_call_site_excludes_every_alive_worker_regardless_of_skills(self):
-        # 起動コマンドの --exclude は _alive_workers (skills を問わない)。skill_ok に戻すと赤。
-        import re
+    # --- 不変条件 A: 通知の後に起動した Worker も、貼った時点で除かれる -------------------
+    def test_worker_started_after_the_command_was_built_is_excluded(self, tmp_path):
+        root = self._setup(tmp_path, ["Aoi", "Ren", "Luna"])
+        self._fake_tmux(root, [])
+        cmd = self._command(root)               # 通知の時点: 誰も居ない
+        first = self._paste(root, cmd)
+        assert "STARTED:Aoi" in first.stdout, first.stderr   # 生きていなければ先頭 (歴代継承)
+        self._fake_tmux(root, ["Aoi"])          # 通知の後に Aoi が起動した
+        again = self._paste(root, cmd)          # 同じ文字列を貼る
+        assert again.returncode == 0 and "STARTED:Aoi" not in again.stdout and "STARTED:" in again.stdout, again.stderr
+
+    def test_worker_alive_only_by_fresh_heartbeat_is_excluded(self, tmp_path):
+        root = self._setup(tmp_path, ["Aoi", "Ren"])
+        self._fake_tmux(root, [])
+        hb = root / "registry" / "heartbeats"
+        hb.mkdir()
+        (hb / "Aoi").write_text("x")            # 窓は無いが heartbeat が新しい (起動直後・mux の一時的な欠落)
+        r = self._paste(root, self._command(root))
+        assert "STARTED:Ren" in r.stdout, r.stderr
+
+    def test_stale_heartbeat_does_not_keep_a_name_excluded(self, tmp_path):
+        import os, time
+        root = self._setup(tmp_path, ["Aoi", "Ren"])
+        self._fake_tmux(root, [])
+        hb = root / "registry" / "heartbeats"
+        hb.mkdir()
+        (hb / "Aoi").write_text("x")
+        old = time.time() - 3600
+        os.utime(hb / "Aoi", (old, old))
+        r = self._paste(root, self._command(root))
+        assert "STARTED:Aoi" in r.stdout, r.stderr
+
+    # --- 不変条件 B: 観測できなければ空の集合に倒さず何も起動しない ---------------------
+    def test_unobservable_mux_starts_nothing(self, tmp_path):
+        root = self._setup(tmp_path, ["Aoi", "Ren"])
+        self._fake_tmux(root, [], server_up=False)   # mux の server に届かない
+        r = self._paste(root, self._command(root))
+        assert r.returncode != 0 and "STARTED" not in r.stdout, (r.stdout, r.stderr)
+
+    def test_unreadable_heartbeat_dir_starts_nothing(self, tmp_path):
+        import os
+        if os.geteuid() == 0:
+            pytest.skip("root は権限で読めてしまう")
+        root = self._setup(tmp_path, ["Aoi", "Ren"])
+        self._fake_tmux(root, [])
+        hb = root / "registry" / "heartbeats"
+        hb.mkdir()
+        hb.chmod(0)
+        try:
+            r = self._paste(root, self._command(root))
+        finally:
+            hb.chmod(0o700)
+        assert r.returncode != 0 and "STARTED" not in r.stdout, (r.stdout, r.stderr)
+
+    def test_the_command_does_not_embed_the_notification_time_snapshot(self, tmp_path):
+        root = self._setup(tmp_path, ["Aoi", "Ren"])
+        cmd = _worker_start_command_for_test(["code"], registry_dir=root / "registry")
+        assert "--exclude \"$LIVE\"" in cmd and "--fresh" not in cmd
+        assert "--exclude Aoi" not in cmd
+
+    def test_dispatcher_shares_one_definition_of_alive(self):
+        # dispatcher の _alive_workers と起動コマンドの alive は lib_worker_target.alive_workers の 1 か所。
         src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dispatcher.sh").read_text()
-        m = re.search(r"worker_start_command\(task_skills, meta\.get\('target_dir'\),\s*exclude=([^,]+?),", src)
-        assert m and m.group(1).strip() == "sorted(_alive_workers)", m and m.group(1)
+        assert "_worker_target.alive_workers(_window_agent_names, REGISTRY_DIR)" in src
+        assert "_hb_file.stat().st_mtime" not in src          # heartbeat の走査のコピーを持たない
+        assert "AGENT_PRESENCE_TTL = _worker_target.AGENT_PRESENCE_TTL" in src
+        import re
+        m = re.search(r"worker_start_command\(task_skills, meta\.get\('target_dir'\),\s*([^)]*)\)", src)
+        assert m and "exclude" not in m.group(1), m and m.group(1)
 
 
-def _worker_start_command_for_test(skills, **kw):
+def _worker_start_command_for_test(skills, registry_dir=None, **kw):
     import re
     src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dispatcher.sh").read_text()
     m = re.search(r"^def worker_start_command\(.*?(?=^def )", src, re.S | re.M)
-    ns = {"shlex": __import__("shlex"), "os": __import__("os"), "REPO_ROOT": pathlib.Path("/x")}
+    ns = {"shlex": __import__("shlex"), "os": __import__("os"), "REPO_ROOT": pathlib.Path("/x"),
+          "REGISTRY_DIR": pathlib.Path(registry_dir or "/x/registry")}
     import os
     old = os.environ.get("CREWVIA_MUX"); os.environ["CREWVIA_MUX"] = "tmux"
     try:

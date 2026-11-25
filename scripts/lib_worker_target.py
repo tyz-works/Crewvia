@@ -52,6 +52,7 @@ CLI (start.sh が使う):
 
     lib_worker_target.py record <registry_dir> <agent> [<target_dir>]   # 原子的に書く
     lib_worker_target.py show   <registry_dir> <agent>
+    lib_worker_target.py alive  <registry_dir>   # 生きている Worker をカンマ区切りで。観測できなければ exit 1・stdout 空
 """
 
 import json
@@ -234,7 +235,78 @@ def sweep_stale_records(registry_dir, live_agents, now=None, warn=None):
     return removed
 
 
+# ---------------------------------------------------------------------------
+# 「生きている Worker」の定義 (dispatcher の `_alive_workers` と起動コマンドの `alive` が共有する 1 か所)
+# ---------------------------------------------------------------------------
+
+#: heartbeat がこの秒数より古ければ「生きている」根拠にしない。
+AGENT_PRESENCE_TTL = 600  # 10 minutes
+
+WORKER_WINDOW_SUFFIX = '-worker'
+
+
+def agent_of_window(window_name):
+    """`<Name>-worker` の窓名から Worker の名前。"""
+    return window_name[:-len(WORKER_WINDOW_SUFFIX)] if window_name.endswith(WORKER_WINDOW_SUFFIX) else window_name
+
+
+def alive_workers(window_agent_names, registry_dir, now=None):
+    """生きている Worker の名前の set: 窓が有る ∪ heartbeat が新しい (どちらか一方でも生きている)。
+
+    窓だけだと mux が 1 人分一時的に落とした回に生きている Worker を落とし、heartbeat だけだと
+    初回の tool 実行前の起動直後の Worker を落とす。dispatcher は同じ定義で can_handle・掃除・
+    起動コマンドの除外を決める。heartbeat の dir が**無い**のは「まだ誰も書いていない」= 空。
+    **読めない** (iterdir / stat の ENOENT 以外の OSError) は OSError のまま上げる (空に倒さない)。
+    """
+    alive = set(window_agent_names)
+    hb_dir = Path(registry_dir) / 'heartbeats'
+    now = time.time() if now is None else now
+    try:
+        entries = list(hb_dir.iterdir())
+    except FileNotFoundError:
+        return alive
+    for f in entries:
+        if f.name.startswith('.'):
+            continue
+        try:
+            if not f.is_file():
+                continue
+            if now - f.stat().st_mtime <= AGENT_PRESENCE_TTL:
+                alive.add(f.name)
+        except FileNotFoundError:
+            continue
+    return alive
+
+
+def observe_alive_workers(registry_dir, mux=None, now=None):
+    """貼った時点で生きている Worker の名前の sorted list。**観測できなければ OSError** (空に倒さない)。
+
+    観測できない = mux の設定が読めない / mux の server が立っていない / heartbeat の dir が読めない。
+    `mux.list()` は読み損ねも `[]` で返すので、server が立っていることを先に確かめる
+    (立っていなければ『誰も居ない』と区別できない)。
+    """
+    if mux is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import lib_mux
+        try:
+            mux = lib_mux.Mux()
+        except lib_mux.MuxConfigUnreadable as e:
+            raise OSError(f'mux config unreadable ({e.code})')
+    if not mux.server_running():
+        raise OSError('mux server not running: cannot observe live Workers')
+    names = [agent_of_window(n) for n in mux.list(suffix=WORKER_WINDOW_SUFFIX)]
+    return sorted(alive_workers(names, registry_dir, now=now))
+
+
 def _main(argv):
+    if len(argv) == 3 and argv[1] == 'alive':
+        try:
+            names = observe_alive_workers(argv[2])
+        except Exception as e:  # noqa: BLE001 — 観測できないことを空の集合にしない
+            print(f'[lib_worker_target] cannot observe live Workers: {e}', file=sys.stderr)
+            return 1
+        print(','.join(names))
+        return 0
     if len(argv) >= 4 and argv[1] == 'record':
         registry_dir, agent = argv[2], argv[3]
         target = argv[4] if len(argv) > 4 and argv[4] else None

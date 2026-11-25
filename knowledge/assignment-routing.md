@@ -45,9 +45,10 @@ Worker として扱われる** (= その間、TARGET_DIR 付きで起動済み�
 回らない。Director が起動コマンドを受け取る)。
 
 - **担当できる Worker が居ないとき** (`no_worker` の Director 通知) は、**そのまま貼れる起動コマンド**を添える:
-  `cd <repo> && AGENT_NAME=$(bash scripts/assign-name.sh <skills> [--exclude <生きている全員の名前>]) && [ -n "$AGENT_NAME" ] && AGENT_NAME="$AGENT_NAME" [TARGET_DIR=<td> ][CREWVIA_BIND_TASK=<slug>/<tid> ]CREWVIA_MUX_ENABLED=1 CREWVIA_MUX=<backend> bash scripts/start.sh worker <skills>`。skill は合う Worker が (別の TARGET_DIR で) 居る
+  `cd <repo> && LIVE=$(CREWVIA_MUX=<backend> python3 scripts/lib_worker_target.py alive <registry>) && AGENT_NAME=$(bash scripts/assign-name.sh <skills> --exclude "$LIVE") && [ -n "$AGENT_NAME" ] && AGENT_NAME="$AGENT_NAME" [TARGET_DIR=<td> ][CREWVIA_BIND_TASK=<slug>/<tid> ]CREWVIA_MUX_ENABLED=1 CREWVIA_MUX=<backend> bash scripts/start.sh worker <skills>`。skill は合う Worker が (別の TARGET_DIR で) 居る
   ときは `--exclude` を並べる (20261125 t001 で `--fresh` をやめた: プール枯渇で空になる。registry-first の名前引きは同じ名前を返し、`start.sh` は「既に居る」で断る)。
   名前は貼った時点で決まる (dispatcher は registry を書き換えない)。
+  **除外する名前も貼った時点で観測する** (20261125-start-command-live-exclude t001): `lib_worker_target.py alive` が「窓が有る ∪ heartbeat が新しい」(dispatcher の `_alive_workers` と同じ `lib_worker_target.alive_workers` 1 か所) を skills を問わず返す。通知時点のスナップショットは埋めない (通知は 1 回だけで、通知から貼るまでに起動した Worker の名前を `start.sh` が「既に居る」で断っていた)。**観測できなければ (mux の設定が読めない・server が立っていない・heartbeat の dir が読めない) `alive` が exit 1 で `&&` が止まり、何も起動しない** (空の集合に倒さない)。heartbeat の dir が**無い**ときは「まだ誰も書いていない」= 空。mux の `list()` は読み損ねも `[]` を返すので、server_running を先に確かめる。戻し方: revert → sync。
 - **skill は合うが TARGET_DIR が合わない task しか残っていない Worker は、no-task と同じく退役させる**
   (C3 / t009。旧実装は「退役させず待機」で、取れない blocked task のために mission 完了後も Worker が残った —
   2026-09-29 の Seo / Zara)。取れる task (`takeable_pending`。blocked を含む) が空で、自分の card も無いとき。

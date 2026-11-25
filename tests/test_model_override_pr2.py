@@ -272,7 +272,7 @@ def test_no_worker_message_carries_bind_command_model_and_exclude(tmp_path):
     assert msgs, mux.sent
     m = msgs[0]
     assert f"CREWVIA_BIND_TASK={SLUG}/t001" in m
-    assert f"--exclude {AGENT}" in m and "--fresh" not in m
+    assert '--exclude "$LIVE"' in m and "lib_worker_target.py alive" in m and "--fresh" not in m
     assert "opus（段上げ）" in m
     assert "CREWVIA_WORKER_MODEL" not in m
     assert "モデル" in m            # 担当できない理由 (model) も出る

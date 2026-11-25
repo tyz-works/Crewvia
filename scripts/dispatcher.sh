@@ -1044,14 +1044,16 @@ def worker_outstanding_assignment(agent_name, all_tasks):
     return None
 
 
-def worker_start_command(task_skills, target_dir, *, fresh, exclude=(), bind_task=None):
+def worker_start_command(task_skills, target_dir, *, exclude=(), bind_task=None):
     """Director がそのまま貼れる Worker 起動コマンド (`director.md` の起動手順と同じ形)。
 
-    `fresh`: 同じ skill の Worker が (別の TARGET_DIR で) 生きているとき。registry-first の
-    名前引きは同じ名前を返し、`start.sh` は「既に居る」で断るので、新しい名前を取らせる。
     名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
-    `exclude`: 同じ skills で生きている Worker の名前。`--fresh` だけだとプール枯渇で空になりうるので並べる
-    (memory parallel-same-skill-worker-needs-exclude)。`bind_task` (`<slug>/<tid>`): 段上げした task 専用の
+    `exclude`: 今生きている Worker の名前 (skills を問わない)。**`--fresh` は付けない**: `--fresh` は
+    「registry に未登録の名前」しか取らず、名前のプールが尽きると空を返す (11-05・11-25 に実害)。
+    `--exclude` だけなら、登録済みで今は生きていない名前 (歴代継承) に回れる。
+    名前が決まらなければ (候補が無い = assign-name.sh が非 0 / 空) `start.sh` は走らない
+    (`AGENT_NAME=$(…) && [ -n "$AGENT_NAME" ] && …`。空の名前・生きている Worker の名前で起動しない)。
+    `bind_task` (`<slug>/<tid>`): 段上げした task 専用の
     Worker にする (`CREWVIA_BIND_TASK`。モデルは start.sh が card から取る — `CREWVIA_WORKER_MODEL` は付けない。設計 §4.3)。
     """
     skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
@@ -1068,11 +1070,11 @@ def worker_start_command(task_skills, target_dir, *, fresh, exclude=(), bind_tas
             backend = 'herdr'
     target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
     bind = f"CREWVIA_BIND_TASK={shlex.quote(bind_task)} " if bind_task else ''
-    excl = f" --exclude {shlex.quote(','.join(exclude))}" if fresh and exclude else ''
+    excl = f" --exclude {shlex.quote(','.join(exclude))}" if exclude else ''
     return (
         f"cd {shlex.quote(str(REPO_ROOT))} && "
-        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{' --fresh' if fresh else ''}{excl}) "
-        f"{target}{bind}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
+        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{excl}) && [ -n \"$AGENT_NAME\" ] && "
+        f"AGENT_NAME=\"$AGENT_NAME\" {target}{bind}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
         f"bash scripts/start.sh worker {skills}"
     )
 
@@ -3279,8 +3281,8 @@ def dispatch():
                     msg += f" — モデル: {_base or '既定'} → {_ov}（段上げ）"
                 msg += (
                     f"。起動コマンド: "
-                    + worker_start_command(task_skills, meta.get('target_dir'), fresh=bool(skill_ok),
-                                           exclude=sorted(skill_ok), bind_task=bind)
+                    + worker_start_command(task_skills, meta.get('target_dir'),
+                                           exclude=sorted(_alive_workers), bind_task=bind)
                 )
                 if tmux_send(_director_name(), msg):
                     record_notify(notify_key)

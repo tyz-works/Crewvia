@@ -553,7 +553,7 @@ echo "[INFO] Worker: $WORKER_NAME"
 | フラグ | 効果 |
 |--------|------|
 | `--exclude <name1,name2,...>` | 指定した名前を lookup とプール選択から除外する。同スキルの並列Worker起動に使う。 |
-| `--fresh` | registry lookup をスキップし、常にプールから新規採番する。プール枯渇時はエラー終了。 |
+| `--fresh` | registry lookup をスキップし、常に **registry 未登録の**名前をプールから採番する。プールが尽きるとエラー終了（`$(…)` は空になる）。dispatcher の起動コマンドは `--fresh` を使わず `--exclude <生きている名前>` だけを付ける（プールが尽きても、登録済みで今は生きていない名前に回る）。 |
 
 ```bash
 # --exclude: 既存Worker(Yuki)を避けて別名を割り当てる
@@ -640,7 +640,7 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
    手で `pull --task` しても exit 3 で断られる**（何も書かれない）。確認は
    `python3 scripts/lib_worker_target.py show "$CREWVIA_REPO_ROOT/registry" <Name>`。
    合う Worker が居ないときの Director 通知には、**そのまま貼れる起動コマンド**が付く
-   （skill に合う Worker が別の TARGET_DIR で居るときは `assign-name.sh --fresh` 付き）。
+   （生きている Worker の名前を `assign-name.sh --exclude` に並べる。`--fresh` は付けない。名前が決まらなければ `start.sh` は走らない）。
    起動済みの Worker は記録を持たない（次の再起動まで `target_dir: null` の Worker として扱われる）ので、
    TARGET_DIR 付きで動いている Worker に target_dir 付きの task が回らないときは
    `lib_worker_target.py record "$CREWVIA_REPO_ROOT/registry" <Name> <target_dir>` で書き直す

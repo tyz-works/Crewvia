@@ -3405,7 +3405,43 @@ def _herdr_panes(data) -> Optional[list]:
     panes = res.get("panes") if isinstance(res, dict) else None
     if not isinstance(panes, list) or not all(isinstance(p, dict) for p in panes):
         return None
+    # 要素の中の値: label / pane_id / tab_id は「無い (欄なし・None)」か str だけ。型の違う値
+    # (数値・list・dict・bool) が 1 つでもあれば一覧全体を読めない扱い (呼び側に型検査を散らさない)。
+    # 空文字は「無い」の側 (spawn が pane_id の無い / 空を SPAWN_UNREADABLE にする)。
+    for p in panes:
+        for key in ("label", "pane_id", "tab_id"):
+            v = p.get(key)
+            if v is not None and not isinstance(v, str):
+                return None
     return panes
+
+
+def _herdr_workspaces(data) -> Optional[list]:
+    """`workspace list` の応答から workspaces を読む。形が読めなければ None。
+
+    読める形 = result.workspaces が list で、要素が全部 dict で、label が None (欄なしを含む) か str。
+    dict でない要素・型の違う label が 1 つでもあれば一覧全体を読めない扱い (その要素が目的の
+    workspace かもしれない = 「無い」とは言えない)。呼び側 (`_workspace_id`) は None なら
+    workspace_create に進まない (空の新 workspace で同名の Worker を二重起動しない)。
+    """
+    res = data.get("result") if isinstance(data, dict) else None
+    workspaces = res.get("workspaces") if isinstance(res, dict) else None
+    if not isinstance(workspaces, list):
+        return None
+    for ws in workspaces:
+        if not isinstance(ws, dict):
+            return None
+        v = ws.get("label")
+        if v is not None and not isinstance(v, str):
+            return None
+    return workspaces
+
+
+def _herdr_result_dict(data, key: str) -> Optional[dict]:
+    """応答の `result[key]` が dict ならそれ、それ以外 (欄なし・型違い) は None。"""
+    res = data.get("result") if isinstance(data, dict) else None
+    sub = res.get(key) if isinstance(res, dict) else None
+    return sub if isinstance(sub, dict) else None
 
 
 class HerdrBackend(_Backend):
@@ -3679,10 +3715,13 @@ class HerdrBackend(_Backend):
         data = _herdr_run("workspace_list", [], timeout=10)
         if data is None:
             return None
-        workspaces = data.get("result", {}).get("workspaces", [])
+        workspaces = _herdr_workspaces(data)
+        if workspaces is None:
+            return None  # 読めない一覧から workspace を作らない (重複作成しない側)
         for ws in workspaces:
             if ws.get("label") == label:
-                return ws.get("workspace_id")
+                wid = ws.get("workspace_id")
+                return wid if isinstance(wid, str) and wid else None
 
         # Create workspace.
         repo_root = os.environ.get(
@@ -3696,8 +3735,9 @@ class HerdrBackend(_Backend):
         )
         if create_data is None:
             return None
-        ws = create_data.get("result", {}).get("workspace", {})
-        return ws.get("workspace_id")
+        ws = _herdr_result_dict(create_data, "workspace") or {}
+        wid = ws.get("workspace_id")
+        return wid if isinstance(wid, str) and wid else None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -3819,12 +3859,18 @@ class HerdrBackend(_Backend):
             self._warn(f"spawn {name!r}: tab create failed")
             return False
 
-        tab = tab_data.get("result", {}).get("tab", {})
+        # 値の型が違う (tab / root_pane が dict でない・id が str でない) 応答も pane_id が
+        # 取れないのと同じ向き (False)。tab はもう作られている (消すかどうかは範囲外)。
+        _res = tab_data.get("result") if isinstance(tab_data, dict) else None
+        tab_shape_ok = not (isinstance(_res, dict) and _res.get("tab") is not None
+                            and not isinstance(_res.get("tab"), dict))
+        tab = _herdr_result_dict(tab_data, "tab") or {}
+        root_pane = _herdr_result_dict(tab_data, "root_pane") or {}
         tab_id = tab.get("tab_id", "")
-        root_pane = tab_data.get("result", {}).get("root_pane", {})
         pane_id = root_pane.get("pane_id", "")
 
-        if not pane_id:
+        if (not tab_shape_ok or not isinstance(pane_id, str) or not pane_id
+                or not isinstance(tab_id, str)):
             self._warn(f"spawn {name!r}: could not get pane_id from tab create result")
             return False
 

@@ -640,7 +640,7 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
    手で `pull --task` しても exit 3 で断られる**（何も書かれない）。確認は
    `python3 scripts/lib_worker_target.py show "$CREWVIA_REPO_ROOT/registry" <Name>`。
    合う Worker が居ないときの Director 通知には、**そのまま貼れる起動コマンド**が付く
-   （生きている Worker の名前を `assign-name.sh --exclude` に並べる。`--fresh` は付けない。名前が決まらなければ `start.sh` は走らない）。
+   （貼った時点で生きている Worker を `lib_worker_target.py alive` で観測し、その名前を `assign-name.sh --exclude "$LIVE"` に渡す。`--fresh` は付けない。観測できない（mux 不達・heartbeat dir が読めない）か名前が決まらなければ `start.sh` は走らない）。
    起動済みの Worker は記録を持たない（次の再起動まで `target_dir: null` の Worker として扱われる）ので、
    TARGET_DIR 付きで動いている Worker に target_dir 付きの task が回らないときは
    `lib_worker_target.py record "$CREWVIA_REPO_ROOT/registry" <Name> <target_dir>` で書き直す

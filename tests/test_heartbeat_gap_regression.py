@@ -396,16 +396,20 @@ def test_E_dispatcher_sh_contains_or_condition_fix():
 
     content = dispatcher_path.read_text()
 
-    # window seed の実装確認
+    # 定義 (window seed + heartbeat union) は lib_worker_target.alive_workers の 1 か所にある
+    # (起動コマンドの `alive` と共有。dispatcher に走査のコピーを持たない)。
     assert "_window_agent_names" in content, \
         "Fix: _window_agent_names (window set) not found in dispatcher.sh"
-    assert "set(_window_agent_names)" in content, \
-        "Fix: _alive_workers seeded with set(_window_agent_names) not found in dispatcher.sh"
-    assert "_hb_fresh" in content, \
-        "Fix: _hb_fresh variable not found in dispatcher.sh"
+    assert "_worker_target.alive_workers(_window_agent_names, REGISTRY_DIR)" in content, \
+        "Fix: _alive_workers must come from lib_worker_target.alive_workers(window names, registry)"
+    assert "_hb_fresh" not in content, \
+        "Old: heartbeat scan copy (_hb_fresh) is back in dispatcher.sh — the definition lives in lib_worker_target"
     # _win_exists is no longer needed — windows are pre-seeded
     assert "_win_exists" not in content, \
         "Old: _win_exists still present in dispatcher.sh (should be removed with window seed fix)"
+    lib = (dispatcher_path.parent / "lib_worker_target.py").read_text()
+    assert "alive = set(window_agent_names)" in lib, "lib: window seed not found"
+    assert "AGENT_PRESENCE_TTL" in lib and "alive.add(f.name)" in lib, "lib: heartbeat union not found"
 
     # 既存の構造が維持されていることを確認
     assert "_alive_workers" in content, \

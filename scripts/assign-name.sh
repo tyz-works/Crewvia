@@ -181,7 +181,9 @@ def _do():
                 break
 
     if chosen is None:
-        chosen = "Unknown"
+        # 候補が 1 つも無い (全部 --exclude / disabled)。偽の名前を作らず、はっきり失敗する。
+        print("ERROR: no eligible worker name available (all excluded or disabled)", file=sys.stderr)
+        sys.exit(1)
 
     # Step 4: Append (or merge into) the chosen name.
     today = str(date.today())

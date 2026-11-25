@@ -842,8 +842,9 @@ class TestDispatcherRouting:
         msg = msgs[0]
         assert f"TARGET_DIR={OTHER_REPO}" in msg
         assert "CREWVIA_MUX_ENABLED=1" in msg and "CREWVIA_MUX=" in msg
-        assert f"AGENT_NAME=$(bash scripts/assign-name.sh code --fresh --exclude {AGENT})" in msg, (
-            "同じ skill の Worker が (別 TARGET_DIR で) 居るので新しい名前を取らせる")
+        assert f"AGENT_NAME=$(bash scripts/assign-name.sh code --exclude {AGENT}) && [ -n \"$AGENT_NAME\" ] && " in msg, (
+            "同じ skill の Worker が (別 TARGET_DIR で) 居るので別の名前を取らせる。--fresh は付けない (プール枯渇で空になる)")
+        assert "--fresh" not in msg
         assert "bash scripts/start.sh worker code" in msg
         assert "担当できません" in msg
 
@@ -925,3 +926,59 @@ def test_dispatcher_and_pull_agree_on_target_matching(sb, tmp_path):
         box.card("t001", target=task_target or "null")
         r = _pull(box, "t001", env_target=worker_target)
         assert (r.returncode == 0) is expected, (name, r.returncode, r.stderr)
+
+
+class TestStartCommandWhenNamePoolIsExhausted:
+    """t001 (20261125): プールが尽きても、貼った起動コマンドは空でない・生きていない名前で起動する。
+    候補が無いときは start.sh を走らせない。"""
+
+    def _run(self, tmp_path, registry_names, alive, bind=None):
+        import subprocess, shutil
+        root = tmp_path / "r"
+        (root / "scripts").mkdir(parents=True)
+        (root / "config").mkdir()
+        import fixture_tree
+        fixture_tree.copy_plan_tree(root)   # lib_* は helper 経由 (名前で指さない)
+        (root / "scripts" / "assign-name.sh").write_bytes(
+            (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "assign-name.sh").read_bytes())
+        (root / "config" / "worker-names.yaml").write_text(
+            "names:\n" + "".join(f"  - {n}\n" for n in registry_names) + "customizations: []\n")
+        (root / "registry").mkdir()
+        (root / "registry" / "workers.yaml").write_text(
+            "workers:\n" + "".join(
+                f"  - name: {n}\n    role: ''\n    skills: [code]\n    task_count: 0\n    last_active: '2026-01-01'\n"
+                for n in registry_names))
+        (root / "scripts" / "start.sh").write_text('#!/usr/bin/env bash\necho "STARTED:$AGENT_NAME"\n')
+        cmd = _worker_start_command_for_test(["code"], exclude=alive, bind_task=bind)
+        cmd = cmd.split(" && ", 1)[1]  # cd <repo> を外して tmp_path の root で走らせる
+        return subprocess.run(["bash", "-c", f"cd {root} && {cmd}"], capture_output=True, text=True)
+
+    def test_exhausted_pool_reuses_a_registered_dead_name(self, tmp_path):
+        r = self._run(tmp_path, ["Aoi", "Ren", "Luna"], alive=["Aoi"])
+        assert r.returncode == 0, r.stderr
+        started = r.stdout.strip().split("STARTED:")[1]
+        assert started and started not in ("Aoi",)
+
+    def test_bound_start_also_gets_a_name(self, tmp_path):
+        r = self._run(tmp_path, ["Aoi", "Ren"], alive=["Aoi"], bind="m/t001")
+        assert r.returncode == 0 and "STARTED:Ren" in r.stdout, r.stderr
+
+    def test_no_candidate_starts_nothing(self, tmp_path):
+        r = self._run(tmp_path, ["Aoi", "Ren"], alive=["Aoi", "Ren"])
+        assert r.returncode != 0 and "STARTED" not in r.stdout
+
+
+def _worker_start_command_for_test(skills, **kw):
+    import re, textwrap
+    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "dispatcher.sh").read_text()
+    m = re.search(r"^def worker_start_command\(.*?(?=^def )", src, re.S | re.M)
+    ns = {"shlex": __import__("shlex"), "os": __import__("os"), "REPO_ROOT": pathlib.Path("/x")}
+    os_env = {"CREWVIA_MUX": "tmux"}
+    import os
+    old = os.environ.get("CREWVIA_MUX"); os.environ["CREWVIA_MUX"] = "tmux"
+    try:
+        exec(m.group(0), ns)
+        return ns["worker_start_command"](skills, None, **kw)
+    finally:
+        if old is None: os.environ.pop("CREWVIA_MUX")
+        else: os.environ["CREWVIA_MUX"] = old

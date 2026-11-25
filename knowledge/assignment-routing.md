@@ -45,9 +45,9 @@ Worker として扱われる** (= その間、TARGET_DIR 付きで起動済み�
 回らない。Director が起動コマンドを受け取る)。
 
 - **担当できる Worker が居ないとき** (`no_worker` の Director 通知) は、**そのまま貼れる起動コマンド**を添える:
-  `cd <repo> && AGENT_NAME=$(bash scripts/assign-name.sh <skills> [--fresh]) [TARGET_DIR=<td>] CREWVIA_MUX_ENABLED=1
+  `cd <repo> && AGENT_NAME=$(bash scripts/assign-name.sh <skills> [--exclude <生きている名前>]) && [ -n "$AGENT_NAME" ] && [TARGET_DIR=<td>] CREWVIA_MUX_ENABLED=1
   CREWVIA_MUX=<backend> bash scripts/start.sh worker <skills>`。skill は合う Worker が (別の TARGET_DIR で) 居る
-  ときは `--fresh` を付ける (registry-first の名前引きは同じ名前を返し、`start.sh` は「既に居る」で断る)。
+  ときは `--exclude` を並べる (20261125 t001 で `--fresh` をやめた: プール枯渇で空になる。registry-first の名前引きは同じ名前を返し、`start.sh` は「既に居る」で断る)。
   名前は貼った時点で決まる (dispatcher は registry を書き換えない)。
 - **skill は合うが TARGET_DIR が合わない task しか残っていない Worker は、no-task と同じく退役させる**
   (C3 / t009。旧実装は「退役させず待機」で、取れない blocked task のために mission 完了後も Worker が残った —

@@ -255,7 +255,8 @@ def alive_workers(window_agent_names, registry_dir, now=None):
 
     窓だけだと mux が 1 人分一時的に落とした回に生きている Worker を落とし、heartbeat だけだと
     初回の tool 実行前の起動直後の Worker を落とす。dispatcher は同じ定義で can_handle・掃除・
-    起動コマンドの除外を決める。heartbeat の dir が**無い**のは「まだ誰も書いていない」= 空。
+    起動コマンドの除外を決める。
+    server は立っているが `mux.list()` が一時的に `[]` を返す回 (herdr の既知の挙動) は、まだ heartbeat を書いていない起動直後の Worker を見逃しうる。その場合は start.sh が「既に居る」で断るので安全側の失敗 (dispatcher と同じ定義なので許容)。heartbeat の dir が**無い**のは「まだ誰も書いていない」= 空。
     **読めない** (iterdir / stat の ENOENT 以外の OSError) は OSError のまま上げる (空に倒さない)。
     """
     alive = set(window_agent_names)
@@ -284,6 +285,7 @@ def observe_alive_workers(registry_dir, mux=None, now=None):
     観測できない = mux の設定が読めない / mux の server が立っていない / heartbeat の dir が読めない。
     `mux.list()` は読み損ねも `[]` で返すので、server が立っていることを先に確かめる
     (立っていなければ『誰も居ない』と区別できない)。
+    server は立っているが `mux.list()` が一時的に `[]` を返す回 (herdr の既知の挙動) は、まだ heartbeat を書いていない起動直後の Worker を見逃しうる。その場合は start.sh が「既に居る」で断るので安全側の失敗 (dispatcher と同じ定義なので許容)。
     """
     if mux is None:
         sys.path.insert(0, str(Path(__file__).resolve().parent))

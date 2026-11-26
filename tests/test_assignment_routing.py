@@ -909,6 +909,27 @@ class TestDispatcherRouting:
         _cycle(repo)
         assert not is_unreadable(wt.load_record(repo / "registry", "Flicker"))
 
+    def test_unreadable_heartbeat_dir_cycle_sweeps_no_target_record(self, repo):
+        """heartbeat の dir が読めず窓だけに戻した回は、窓の無い Worker の記録を 1 件も掃除しない。"""
+        if os.geteuid() == 0:
+            pytest.skip("root は権限で読めてしまう")
+        _set_card(repo, "t001", target="null")
+        wt.write_record(repo / "registry", "Hbonly", OTHER_REPO)
+        rp = wt.record_path(repo / "registry", "Hbonly")
+        old = time.time() - 10 * wt.SWEEP_MIN_AGE_SECONDS
+        os.utime(rp, (old, old))
+        wt.write_record(repo / "registry", AGENT, None)
+        hb = repo / "registry" / "heartbeats"
+        hb.mkdir(parents=True, exist_ok=True)
+        (hb / "Hbonly").write_text("alive")
+        hb.chmod(0)
+        try:
+            _cycle(repo)
+        finally:
+            hb.chmod(0o700)
+        assert not is_unreadable(wt.load_record(repo / "registry", "Hbonly")) and \
+            not is_missing(wt.load_record(repo / "registry", "Hbonly")), "記録が掃除された"
+
 
 # ---------------------------------------------------------------------------
 # 一つの規則 — dispatcher と plan.sh が同じ答えを出す

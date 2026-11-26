@@ -2917,13 +2917,20 @@ def dispatch():
     #   - Both stale + no window → truly dead → can_handle=False (correct).
     _window_agent_names: set = {w['agent_name'] for w in windows}
     # 定義は lib_worker_target.alive_workers の 1 か所 (起動コマンドの `alive` と共有)。
+    # 生きている集合を完全に観測できた回 (heartbeat を読めた回) だけ True。読めずに窓だけへ戻した回は
+    # False で、TARGET_DIR の記録の掃除はその回は飛ばす (割り当てなど他の処理は窓だけの集合のまま)。
+    _alive_observed_fully = True
     try:
         _alive_workers: set = _worker_target.alive_workers(_window_agent_names, REGISTRY_DIR)
     except OSError as _e:
         log(f"WARNING: heartbeats dir unreadable ({_e!r}); alive set = windows only")
         _alive_workers = set(_window_agent_names)
+        _alive_observed_fully = False
 
-    sweep_stale_target_records(_alive_workers)
+    if _alive_observed_fully:
+        sweep_stale_target_records(_alive_workers)
+    else:
+        log("[target-record] sweep skipped this cycle: live Workers not fully observed")
 
     # Track which tasks were assigned this cycle to avoid double-dispatch.
     # Keyed as (slug, task_id) tuples so that missions reusing the same

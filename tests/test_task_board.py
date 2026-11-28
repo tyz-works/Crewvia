@@ -151,7 +151,7 @@ def test_a_failing_board_never_breaks_plan_sh(sandbox, monkeypatch):
     _card(sandbox, "t001", "pending")
     (sandbox.root / "scripts" / "lib_task_board.py").write_text("def render_board(*a, **k):\n    raise RuntimeError('boom')\n"
                                                                    "def static_stuck_kind(t):\n    return None\n")
-    r = sandbox.run("board")
+    r = sandbox.run("update", "t001", "--status", "blocked", "--blocked-reason", "x")  # 自動の生成
     assert r.returncode == 0
     assert sandbox.graph.exists() and "board.html の生成に失敗" in r.stderr
 
@@ -163,3 +163,43 @@ def test_boxes_and_edges_are_drawn(sandbox):
     page = board.read_text()
     assert page.count('class="node ') == 2 and page.count("marker-end") == 1
     assert 'http-equiv="refresh"' in page and "生成:" in page
+
+
+def test_reason_follows_the_current_status_not_a_stale_field(sandbox):
+    """古い needs_director_reason が残っていても、今の status に対応する欄だけを理由に出す。"""
+    _card(sandbox, "t001", "blocked", reason="STALE-ND", reason_key="needs_director_reason")
+    p = sandbox.queue / "missions" / MISSION / "tasks" / "t001.md"
+    p.write_text(p.read_text().replace("---\n\n## Description", 'blocked_reason: "FRESH-BLOCKED"\n---\n\n## Description', 1))
+    _card(sandbox, "t002", "failed", reason="STALE-ND2")
+    _card(sandbox, "t003", "needs_director", reason="LIVE-ND")
+    r, board = _board(sandbox)
+    assert r.returncode == 0, r.stderr
+    page = board.read_text()
+    assert "FRESH-BLOCKED" in page and "LIVE-ND" in page
+    assert "STALE-ND" not in page and "STALE-ND2" not in page
+
+
+def test_explicit_board_fails_loudly_when_it_cannot_write(sandbox):
+    _card(sandbox, "t001", "pending")
+    r, board = _board(sandbox)
+    assert r.returncode == 0 and board.exists()
+    (sandbox.root / "scripts" / "lib_task_board.py").write_text(
+        "def render_board(*a, **k):\n    raise RuntimeError('boom')\n"
+        "def static_stuck_kind(t):\n    return None\n")
+    r = sandbox.run("board")
+    assert r.returncode != 0
+    assert r.stdout.strip() == ""
+    assert "board.html を書けませんでした" in r.stderr
+    # 自動の生成は今どおり本体を止めない
+    r = sandbox.run("update", "t001", "--status", "blocked", "--blocked-reason", "x")
+    assert r.returncode == 0, r.stderr
+
+
+def test_blocked_downstream_is_listed_in_task_number_order(sandbox):
+    _card(sandbox, "t001", "failed")
+    _card(sandbox, "t010", "pending", ["t001"])
+    _card(sandbox, "t005", "pending", ["t001"])
+    _card(sandbox, "t020", "pending", ["t010"])   # 遠い順 (downstream_closure の戻り) は t020, t005, t010
+    r, board = _board(sandbox)
+    assert r.returncode == 0, r.stderr
+    assert "t005, t010, t020" in _stuck_section(board.read_text())

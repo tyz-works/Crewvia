@@ -214,9 +214,9 @@ def test_generation_is_never_called_inside_a_function(tree):
     示せる。将来 with_lock の形が変わっても崩れない言い方で固定する。
     """
     #: 生成機構そのもの。この中で互いを呼ぶのは組み立てであって、呼び出し口ではない。
-    GENERATOR = {"maybe_refresh_task_graph", "refresh_task_graph", "build_task_graph"}
+    GENERATOR = {"maybe_refresh_task_graph", "refresh_task_graph", "build_task_graph", "write_task_board"}
     #: 生成を始めてよい関数 (明示的なサブコマンドだけ)。
-    ALLOWED_ENTRYPOINTS = {"cmd_task_graph"}
+    ALLOWED_ENTRYPOINTS = {"cmd_task_graph", "cmd_board"}
 
     inside: list[str] = []
 

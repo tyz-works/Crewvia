@@ -89,6 +89,7 @@ set -euo pipefail
 #                              --no-wait: キューロックを待たずに諦め exit 4。
 #                              待てない常駐デーモン (watchdog) 用
 #   plan.sh task-graph          herdr-task-graph 用の tasks.json を書き出す
+#   plan.sh board               tasks.json と一緒に board.html (止まっている所と依存の図) を書き出す
 #                              （queue は変更しない。普段は queue を書き換える
 #                                サブコマンドが自動で呼ぶ）
 #   plan.sh status [--mission <slug>] [--all]
@@ -138,7 +139,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr|ci-gate|model-for> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|board|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr|ci-gate|model-for> [args...]" >&2
   exit 1
 fi
 
@@ -961,6 +962,8 @@ def _warn_task_card(msg):
 _DEP_RULES = _load_scripts_module('lib_dep_rules')
 # PR の CI の記録 (dispatcher が registry/ci/ に書く) を読む口。plan.sh は gh を呼ばない・記録を書かない (knowledge/ci-status.md)。
 _CI_STATUS = _load_scripts_module('lib_ci_status')
+# board.html (止まっている所と依存の図) を描く純粋関数。依存の判定は持たず、ここ (plan.sh) が lib_dep_rules から作った値を渡す。
+_TASK_BOARD = _load_scripts_module('lib_task_board')
 
 
 def ci_status_line(slug, task_id, task):
@@ -1046,7 +1049,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr', 'ci-gate',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'board', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr', 'ci-gate',
     'model-for',
 }
 
@@ -1782,6 +1785,74 @@ def release_task_graph_lock(lf):
         lf.close()
 
 
+def task_board_path(graph_path):
+    """board.html の書き先 = tasks.json の隣 (同じ dir・同じ停止スイッチ・同じ原子的な書き込み)。"""
+    return os.path.join(os.path.dirname(graph_path), 'board.html')
+
+
+def build_task_board(state):
+    """active mission 全部を board 用の dict にする。**queue は読むだけ**。
+
+    依存の「満たされた / 保留」は `card_dependencies()` の答えをそのまま渡す (ここで再判定しない)。
+    読めない card (`CORRUPT_TASK_STATUS`) は消さず `unreadable` として残す。
+    出す欄は title / status / 依存 / worker / started_at / 理由の 1 行だけ (Result・本文・env は渡さない)。
+    """
+    slugs = []
+    for s in (state.get('active_missions') or []):
+        if s and s not in slugs:
+            slugs.append(s)
+    missions = []
+    for slug in slugs:
+        if not os.path.isdir(mission_dir(slug)):
+            continue
+        cards = list_tasks(slug, quiet=True)
+        done_ids = {m['id'] for (m, _) in cards if m.get('status') in TERMINAL_STATUSES}
+        statuses = {m['id']: m.get('status') for (m, _) in cards}
+        tasks = []
+        for (meta, _body) in cards:
+            tid = meta.get('id') or '?'
+            raw_status = meta.get('status')
+            deps = [str(d) for d in declared_dependencies(meta.get('blocked_by'))]
+            held, unmet = [], []
+            if raw_status == 'pending':
+                verdict = card_dependencies(meta, done_ids, statuses)
+                held = [str(d) for d in verdict.held]
+                unmet = [str(d) for d in verdict.unmet]
+            reason = meta.get('needs_director_reason') or meta.get('blocked_reason')
+            reason = str(reason).splitlines()[0] if reason and str(reason).strip() else None
+            started = meta.get('started_at')
+            tasks.append({
+                'id': str(tid),
+                'title': str(meta.get('title') or tid),
+                'status': str(raw_status),
+                'worker': _task_graph_worker(meta),
+                'started_at': str(started) if started else None,
+                'reason': reason,
+                'deps': deps,
+                'held': held,
+                'unmet': unmet,
+                'unreadable': raw_status == CORRUPT_TASK_STATUS,
+                'blocks': [],
+            })
+        # 止まっている task が塞ぐ下流 (列挙は lib_dep_rules の 1 か所)
+        graph = {t['id']: t['deps'] for t in tasks}
+        for t in tasks:
+            if _TASK_BOARD.static_stuck_kind(t):
+                t['blocks'] = _DEP_RULES.downstream_closure(graph, t['id'])
+        missions.append({'slug': slug, 'tasks': tasks})
+    return missions
+
+
+def write_task_board(graph_path, state):
+    """board.html を書く。失敗しても plan.sh の本体は止めない (tasks.json の失敗と同じ扱い)。"""
+    try:
+        missions = build_task_board(state)
+        page = _TASK_BOARD.render_board(missions, now_iso(), time.time())
+        _atomic_write(task_board_path(graph_path), page)
+    except (Exception, SystemExit) as e:
+        print(f"[plan.sh warn] board.html の生成に失敗しました: {e}", file=sys.stderr)
+
+
 def refresh_task_graph():
     """生成物を書き出す。読み取りごと直列化し、tmp + os.replace で置き換える。
 
@@ -1847,8 +1918,10 @@ def refresh_task_graph():
             # 含まれていることが言える (要求者は queue を書き終えてから
             # ロックを待ち、諦めてから要求を置くため)。
             read_started = time.monotonic_ns()
-            graph = build_task_graph(load_state())
+            state = load_state()
+            graph = build_task_graph(state)
             _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
+            write_task_board(path, state)
             with task_graph_pending_lock(path) as in_section:
                 if not in_section:
                     # 区間に入れなかった。**印には一切触れずに** 本ロックだけ
@@ -2769,6 +2842,7 @@ USAGE = {
     'review': 'plan.sh review <mission_slug>',
     'launch': 'plan.sh launch <mission_slug>',
     'task-graph': 'plan.sh task-graph',
+    'board': 'plan.sh board',
     'lint': 'plan.sh lint [<mission_slug> | --mission <slug>] [--strict]',
     'status': 'plan.sh status [--mission <slug>] [--all]',
     'archive': 'plan.sh archive <slug>',
@@ -2792,7 +2866,7 @@ POSITIONAL_ARITY = {
     'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'retry': (1, 1), 'reopen': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
-    'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
+    'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'board': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'history': (1, 1), 'pr-base': (0, 0),
     'resolve-pr': (1, 1), 'ci-gate': (1, 1), 'model-for': (1, 1),
@@ -3796,7 +3870,7 @@ _INTENT_FREEZE = {
     # 読み取り専用 (queue の card を書かない)
     'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
     'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'resolve-pr': 'allow', 'ci-gate': 'allow',
-    'task-graph': 'allow', 'resync': 'allow', 'model-for': 'allow',
+    'task-graph': 'allow', 'board': 'allow', 'resync': 'allow', 'model-for': 'allow',
     # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
     # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
     # init は `--force` で既存の mission を退避する = 本体の中で `_die_if_intent_stuck_before_move` が止める (他の形は新しい slug を作るだけ)。
@@ -6945,6 +7019,27 @@ def cmd_task_graph(args):
     print(refresh_task_graph())
 
 
+def cmd_board(args):
+    """Usage: plan.sh board
+
+    board.html (止まっている所と依存の図) を今すぐ書き出してパスを印字する。tasks.json も同時に作り直す
+    (同じ原子的な書き込み・同じ直列化)。queue は変更しない。開き方:
+    terminal-browser で file://<パス> (knowledge/task-graph.md)。
+    """
+    parse_opts(args, {})
+    if not task_graph_enabled():
+        print("[plan.sh] CREWVIA_TASK_GRAPH=0 のため生成しません", file=sys.stderr)
+        return
+    if not task_graph_queue_matches_root():
+        die(
+            f"[plan.sh] board: CREWVIA_QUEUE ({QUEUE_DIR}) が "
+            f"{task_graph_repo_root()}/queue ではありません。書き先を明示してください "
+            f"(CREWVIA_TASK_GRAPH_FILE=<path> plan.sh board)",
+            PRECONDITION_UNMET,
+        )
+    print(task_board_path(refresh_task_graph()))
+
+
 def cmd_lint(args):
     opts, positional = parse_opts(args, {'--strict': 'bool', '--mission': 'value'})
     slug = opts.get('--mission') or (positional[0] if positional else None)
@@ -8360,6 +8455,7 @@ dispatch = {
     'review': cmd_review,
     'launch': cmd_launch,
     'task-graph': cmd_task_graph,
+    'board': cmd_board,
     'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,

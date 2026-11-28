@@ -465,6 +465,19 @@ fails, `plan.sh` logs one line to stderr and keeps its own exit code. Set
 `CREWVIA_TASK_GRAPH=0` to turn generation off completely (nothing is written, nothing is
 logged).
 
+#### board.html (works without the plugin, e.g. under Rex)
+
+Next to `tasks.json`, `plan.sh` also writes a self-contained `registry/task-graph/board.html`
+(no external CSS/JS/fonts; same `CREWVIA_TASK_GRAPH=0` switch, same atomic write). The top
+lists what is **stuck** (needs_director with its reason, failed, held by a failed dependency,
+blocked, unreadable cards, in_progress for 60+ minutes) or says nothing is stuck; below it is
+the per-mission dependency graph with workers and elapsed time. It reloads itself every few
+seconds. Rebuild it by hand with `plan.sh board` and open it in the terminal browser:
+
+```bash
+terminal-browser   # then open file:///<crewvia checkout>/registry/task-graph/board.html
+```
+
 #### Setup (once)
 
 Run this from the **main checkout** of Crewvia, not from a worker worktree — the symlink

@@ -1790,6 +1790,12 @@ def task_board_path(graph_path):
     return os.path.join(os.path.dirname(graph_path), 'board.html')
 
 
+def _task_id_sort_key(tid):
+    """tNNN を番号順に (t2 < t10)。数字でない id は後ろに文字順。見た目だけ。"""
+    m = re.fullmatch(r't(\d+)', str(tid))
+    return (0, int(m.group(1)), '') if m else (1, 0, str(tid))
+
+
 def build_task_board(state):
     """active mission 全部を board 用の dict にする。**queue は読むだけ**。
 
@@ -1818,7 +1824,16 @@ def build_task_board(state):
                 verdict = card_dependencies(meta, done_ids, statuses)
                 held = [str(d) for d in verdict.held]
                 unmet = [str(d) for d in verdict.unmet]
-            reason = meta.get('needs_director_reason') or meta.get('blocked_reason')
+            # 理由は今の status に対応する欄だけ (古い needs_director_reason が card に残っていても出さない)。
+            # needs_director_reason は needs_director への遷移でしか書かれず消されないので、後の status
+            # (ready_for_verification / needs_human_review 等) では古い。出すのは WAITS_ON_DIRECTOR_STATUSES だけ
+            # (集合リテラルをここに並べない)。
+            if raw_status in _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES:
+                reason = meta.get('needs_director_reason')
+            elif raw_status == 'blocked':
+                reason = meta.get('blocked_reason')
+            else:
+                reason = None
             reason = str(reason).splitlines()[0] if reason and str(reason).strip() else None
             started = meta.get('started_at')
             tasks.append({
@@ -1838,18 +1853,25 @@ def build_task_board(state):
         graph = {t['id']: t['deps'] for t in tasks}
         for t in tasks:
             if _TASK_BOARD.static_stuck_kind(t):
-                t['blocks'] = _DEP_RULES.downstream_closure(graph, t['id'])
+                t['blocks'] = sorted(_DEP_RULES.downstream_closure(graph, t['id']), key=_task_id_sort_key)
         missions.append({'slug': slug, 'tasks': tasks})
     return missions
 
 
+#: 直近の write_task_board の失敗 (無ければ None)。自動の生成は読まず、明示の `plan.sh board` だけが見る。
+_BOARD_WRITE_ERROR = None
+
+
 def write_task_board(graph_path, state):
     """board.html を書く。失敗しても plan.sh の本体は止めない (tasks.json の失敗と同じ扱い)。"""
+    global _BOARD_WRITE_ERROR
+    _BOARD_WRITE_ERROR = None
     try:
         missions = build_task_board(state)
         page = _TASK_BOARD.render_board(missions, now_iso(), time.time())
         _atomic_write(task_board_path(graph_path), page)
     except (Exception, SystemExit) as e:
+        _BOARD_WRITE_ERROR = e
         print(f"[plan.sh warn] board.html の生成に失敗しました: {e}", file=sys.stderr)
 
 
@@ -7037,7 +7059,11 @@ def cmd_board(args):
             f"(CREWVIA_TASK_GRAPH_FILE=<path> plan.sh board)",
             PRECONDITION_UNMET,
         )
-    print(task_board_path(refresh_task_graph()))
+    path = task_board_path(refresh_task_graph())
+    if _BOARD_WRITE_ERROR is not None:
+        # 明示の board は「書けた」ときだけパスを返す (前の board.html のパスを印字しない)
+        die(f"[plan.sh] board: board.html を書けませんでした: {_BOARD_WRITE_ERROR}", 1)
+    print(path)
 
 
 def cmd_lint(args):

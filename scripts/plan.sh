@@ -1825,10 +1825,15 @@ def build_task_board(state):
                 held = [str(d) for d in verdict.held]
                 unmet = [str(d) for d in verdict.unmet]
             # 理由は今の status に対応する欄だけ (古い needs_director_reason が card に残っていても出さない)。
-            # status の分類は lib_task_board.static_stuck_kind の 1 か所 (集合リテラルをここに並べない)。
-            kind = _TASK_BOARD.static_stuck_kind({'status': raw_status})
-            reason = {'needs_director': meta.get('needs_director_reason'),
-                      'blocked': meta.get('blocked_reason')}.get(kind)
+            # needs_director_reason は needs_director への遷移でしか書かれず消されないので、後の status
+            # (ready_for_verification / needs_human_review 等) では古い。出すのは WAITS_ON_DIRECTOR_STATUSES だけ
+            # (集合リテラルをここに並べない)。
+            if raw_status in _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES:
+                reason = meta.get('needs_director_reason')
+            elif raw_status == 'blocked':
+                reason = meta.get('blocked_reason')
+            else:
+                reason = None
             reason = str(reason).splitlines()[0] if reason and str(reason).strip() else None
             started = meta.get('started_at')
             tasks.append({

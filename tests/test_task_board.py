@@ -179,6 +179,17 @@ def test_reason_follows_the_current_status_not_a_stale_field(sandbox):
     assert "STALE-ND" not in page and "STALE-ND2" not in page
 
 
+@pytest.mark.parametrize("status", ["ready_for_verification", "needs_human_review"])
+def test_stale_needs_director_reason_is_not_shown_after_the_card_moved_on(sandbox, status):
+    """needs_director_reason は needs_director のときだけ。判断待ちに進んだ後の card では古いので出さない。"""
+    _card(sandbox, "t001", status, reason="STALE-ND")
+    r, board = _board(sandbox)
+    assert r.returncode == 0, r.stderr
+    page = board.read_text()
+    assert "STALE-ND" not in page
+    assert "t001" in _stuck_section(page)  # 判断待ちの一覧には出る
+
+
 def test_explicit_board_fails_loudly_when_it_cannot_write(sandbox):
     _card(sandbox, "t001", "pending")
     r, board = _board(sandbox)

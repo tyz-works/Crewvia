@@ -445,3 +445,28 @@ ERROR なし。**`unlink` / `link` しても config dir の `tasks.json` symlink
 - **幅 200 の AGENTS パネルによる箱の縮み**（O-2）: 見た目のみ。upstream
 - **agent の状態遷移（idle → working）が箱に追従するか**: t011 は `claude · idle` の表示までで
   遷移は見ていない（§4-4）
+
+---
+
+## 10. board.html（止まっている所と依存の図。Rex でも見られる）
+
+`plan.sh` が `tasks.json` を書くのと**同じ所**（`refresh_task_graph()` の中。同じロック・同じ
+`CREWVIA_TASK_GRAPH=0` の停止スイッチ・同じ tmp → `os.replace`）で、隣に自己完結の
+`registry/task-graph/board.html` を書く（外部の CSS / JS / フォントを読まない）。herdr-task-graph の
+plugin が使えない Rex / hc 環境でも、止まっている所と依存の図が見られる。
+
+- 手で作り直す: `plan.sh board`（書いたパスを印字。tasks.json も同時に作り直す。queue は書かない）。
+- 開き方: `terminal-browser` で `file:///<repo>/registry/task-graph/board.html`（5 秒ごとに自分を読み直す）。
+- **一番上の「止まっている所」**: `needs_director`（理由の 1 行）・`failed`・依存先が `failed` で保留（出口は
+  `plan.sh release-dep`）・`blocked`・読めない card・`in_progress` のまま 60 分以上（経過はページ内の JS が
+  数え続ける。しきい値は `lib_task_board.LONG_RUNNING_MINUTES`）。0 件なら「止まっている所はありません」。
+  止まっている task が塞いでいる下流は理由の行と図の橙の影で分かる。
+- **その下に mission ごとの依存の図**: 箱（ID・タイトル・status の色・Worker・経過）と矢印。
+- 実装: 描画は純粋関数の `scripts/lib_task_board.py`（ファイルも queue も開かない）。plan.sh の
+  `build_task_board()` が `lib_task_cards`（`list_tasks`）と `lib_dep_rules`（`card_dependencies` /
+  `downstream_closure`）から入力を作る。**依存の「満たされた / 保留」はここでも再判定しない**。
+- 出すのは title・status・依存・Worker・時刻・理由の 1 行だけ（Result・本文・env は渡さない）。文字列は
+  全部 HTML エスケープ。読めない card は消さず「読めない」として出す。
+- 生成に失敗しても plan.sh の本体と tasks.json は止まらない（stderr に 1 行）。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`board.html` は残ってよい（消してよい生成物）。
+- テスト: `tests/test_task_board.py`。

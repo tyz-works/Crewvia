@@ -193,6 +193,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
     "review": [["review", MISSION]],
     "launch": [["launch", MISSION]],
     "task-graph": [["task-graph"]],
+    "board": [["board"]],
     "lint": [["lint", MISSION]],
     "status": [["status", "--mission", MISSION]],
     "archive": [["archive", "iso-two"]],
